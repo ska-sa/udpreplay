@@ -14,7 +14,7 @@ struct options
     double pps = 0;
     size_t buffer_size = 1024 * 1024;
     std::string host = "localhost";
-    int port = 12345;
+    std::string port = "12345";
     std::string input_file;
 };
 
@@ -24,10 +24,15 @@ struct sender
     udp::socket socket;
     udp::endpoint endpoint;
 
-    sender() : socket(io_service), endpoint(asio::ip::address_v4::loopback(), 12345)
+    explicit sender(const options &opts)
+        : socket(io_service)
     {
+        udp::resolver resolver(io_service);
+        udp::resolver::query query(udp::v4(), opts.host, opts.port);
+        endpoint = *resolver.resolve(query);
         socket.open(udp::v4());
-        socket.set_option(decltype(socket)::send_buffer_size(1024 * 1024));
+        if (opts.buffer_size != 0)
+            socket.set_option(decltype(socket)::send_buffer_size(opts.buffer_size));
     }
 };
 
@@ -63,7 +68,7 @@ static void callback(u_char *user, const struct pcap_pkthdr *h, const u_char *by
     }
 }
 
-static int run(pcap_t *p)
+static int run(pcap_t *p, const options &opts)
 {
     struct bpf_program fp;
     if (pcap_datalink(p) != DLT_EN10MB)
@@ -84,7 +89,7 @@ static int run(pcap_t *p)
         return 1;
     }
 
-    sender s;
+    sender s(opts);
     pcap_loop(p, -1, callback, (u_char *) &s);
     return 0;
 }
@@ -101,7 +106,7 @@ static options parse_args(int argc, char **argv)
     desc.add_options()
         ("pps", po::value<double>(&out.pps)->default_value(defaults.pps), "packets per second (0 for max speed")
         ("host", po::value<std::string>(&out.host)->default_value(defaults.host), "destination host")
-        ("port", po::value<int>(&out.port)->default_value(defaults.port), "destination port")
+        ("port", po::value<std::string>(&out.port)->default_value(defaults.port), "destination port")
         ("buffer-size", po::value<size_t>(&out.buffer_size)->default_value(defaults.buffer_size), "transmit buffer size (0 for system default)")
         ;
 
@@ -149,7 +154,7 @@ int main(int argc, char **argv)
     {
         options opts = parse_args(argc, argv);
         std::shared_ptr<pcap_t> p = open_capture(opts);
-        run(p.get());
+        run(p.get(), opts);
     }
     catch (po::error &e)
     {

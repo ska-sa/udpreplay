@@ -1,6 +1,6 @@
 CXX = g++
 CXXFLAGS = -Wall -g -std=c++11
-LDFLAGS = -lpcap -lboost_system -lboost_program_options
+LDFLAGS = -lpcap -lboost_system -lboost_program_options -lpthread
 TARGETS = udpreplay
 
 all: $(TARGETS)
