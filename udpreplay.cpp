@@ -1,8 +1,8 @@
 #include <iostream>
 #include <memory>
+#include <chrono>
 #include <pcap.h>
 #include <boost/asio.hpp>
-#include <boost/thread.hpp>
 #include <boost/program_options.hpp>
 
 namespace asio = boost::asio;
@@ -23,6 +23,8 @@ struct sender
     boost::asio::io_service io_service;
     udp::socket socket;
     udp::endpoint endpoint;
+    std::chrono::time_point<std::chrono::high_resolution_clock> next_send;
+    std::chrono::nanoseconds interval;
 
     explicit sender(const options &opts)
         : socket(io_service)
@@ -33,6 +35,17 @@ struct sender
         socket.open(udp::v4());
         if (opts.buffer_size != 0)
             socket.set_option(decltype(socket)::send_buffer_size(opts.buffer_size));
+        next_send = std::chrono::high_resolution_clock::now();
+        interval = std::chrono::nanoseconds(opts.pps ? long(1000000000 / opts.pps) : 0);
+    }
+
+    void send_packet(const u_char *data, std::size_t len)
+    {
+        asio::basic_waitable_timer<std::chrono::high_resolution_clock> timer(io_service);
+        timer.expires_at(next_send);
+        timer.wait();
+        socket.send_to(asio::buffer(data, len), endpoint);
+        next_send += interval;
     }
 };
 
@@ -60,10 +73,7 @@ static void callback(u_char *user, const struct pcap_pkthdr *h, const u_char *by
             len -= udp_hsize;
 
             sender *s = (sender *) user;
-            asio::deadline_timer t(s->io_service);
-            t.expires_from_now(boost::posix_time::microseconds(100));
-            t.wait();
-            s->socket.send_to(asio::buffer(bytes, len), s->endpoint);
+            s->send_packet(bytes, len);
         }
     }
 }
