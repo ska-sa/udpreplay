@@ -1,3 +1,14 @@
+/* Replays UDP packets from a pcap dump. Unlike tcpreplay, it only replays the
+ * payload and not the headers, so it does not require root privileges and
+ * works fine with the Linux loopback device.
+ *
+ * It supports rate control, either in packets per second or bits per second.
+ * It does not support replay at the original speed.
+ *
+ * It is currently single-threaded, and hence can fall behind the requested
+ * rate if pcap is too slow.
+ */
+
 #include <iostream>
 #include <memory>
 #include <chrono>
@@ -12,9 +23,10 @@ using boost::asio::ip::udp;
 struct options
 {
     double pps = 0;
-    size_t buffer_size = 1024 * 1024;
+    double mbps = 0;
+    size_t buffer_size = 0;
     std::string host = "localhost";
-    std::string port = "12345";
+    std::string port = "8888";
     std::string input_file;
 };
 
@@ -24,7 +36,8 @@ struct sender
     udp::socket socket;
     udp::endpoint endpoint;
     std::chrono::time_point<std::chrono::high_resolution_clock> next_send;
-    std::chrono::nanoseconds interval;
+    std::chrono::nanoseconds pps_interval{0};
+    double ns_per_byte = 0;
 
     explicit sender(const options &opts)
         : socket(io_service)
@@ -36,7 +49,10 @@ struct sender
         if (opts.buffer_size != 0)
             socket.set_option(decltype(socket)::send_buffer_size(opts.buffer_size));
         next_send = std::chrono::high_resolution_clock::now();
-        interval = std::chrono::nanoseconds(opts.pps ? long(1000000000 / opts.pps) : 0);
+        if (opts.pps != 0)
+            pps_interval = std::chrono::nanoseconds(uint64_t(1e9 / opts.pps));
+        if (opts.mbps != 0)
+            ns_per_byte = 8000.0 / opts.mbps;
     }
 
     void send_packet(const u_char *data, std::size_t len)
@@ -45,13 +61,13 @@ struct sender
         timer.expires_at(next_send);
         timer.wait();
         socket.send_to(asio::buffer(data, len), endpoint);
-        next_send += interval;
+        next_send += pps_interval;
+        next_send += std::chrono::nanoseconds(uint64_t(ns_per_byte * len));
     }
 };
 
 static void callback(u_char *user, const struct pcap_pkthdr *h, const u_char *bytes)
 {
-    std::cout << "Got a packet\n";
     const unsigned int eth_hsize = 14;
     bpf_u_int32 len = h->caplen;
     if (h->len != len)
@@ -114,7 +130,8 @@ static options parse_args(int argc, char **argv)
 
     po::options_description desc;
     desc.add_options()
-        ("pps", po::value<double>(&out.pps)->default_value(defaults.pps), "packets per second (0 for max speed")
+        ("pps", po::value<double>(&out.pps), "packets per second (0 for max speed")
+        ("mbps", po::value<double>(&out.mbps), "bits per second (0 for max speed")
         ("host", po::value<std::string>(&out.host)->default_value(defaults.host), "destination host")
         ("port", po::value<std::string>(&out.port)->default_value(defaults.port), "destination port")
         ("buffer-size", po::value<size_t>(&out.buffer_size)->default_value(defaults.buffer_size), "transmit buffer size (0 for system default)")
@@ -137,11 +154,14 @@ static options parse_args(int argc, char **argv)
                   .positional(positional)
                   .run(), vm);
         po::notify(vm);
+        if (vm.count("pps") && vm.count("mbps"))
+            throw po::error("Cannot specify both --pps and --mbps");
         return out;
     }
     catch (po::error &e)
     {
         std::cerr << e.what() << "\n\n";
+        std::cerr << "Usage: udpreplay [options] capturefile\n";
         std::cerr << desc;
         throw;
     }
