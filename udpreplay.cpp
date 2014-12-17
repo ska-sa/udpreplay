@@ -9,11 +9,20 @@
  * rate if pcap is too slow.
  */
 
+#define USE_SENDMMSG 0
+
+#if USE_SENDMMSG
+# include <sys/socket.h>
+# include <netinet/in.h>
+# include <netinet/ip.h>
+# include <arpa/inet.h>
+#endif
 #include <iostream>
 #include <memory>
 #include <vector>
 #include <list>
 #include <chrono>
+#include <cstring>
 #include <pcap.h>
 #include <boost/asio.hpp>
 #include <boost/program_options.hpp>
@@ -33,21 +42,14 @@ struct options
     std::string input_file;
 };
 
-class sender
+class asio_transmit
 {
 private:
-    boost::asio::io_service io_service;
     udp::socket socket;
     udp::endpoint endpoint;
-    std::chrono::time_point<std::chrono::high_resolution_clock> start_time;
-    std::chrono::time_point<std::chrono::high_resolution_clock> next_send;
-    std::chrono::nanoseconds pps_interval{0};
-    double ns_per_byte = 0;
-    bool limited = false;
-    std::int64_t bytes = 0;
 
 public:
-    explicit sender(const options &opts)
+    asio_transmit(const options &opts, boost::asio::io_service &io_service)
         : socket(io_service)
     {
         udp::resolver resolver(io_service);
@@ -56,6 +58,100 @@ public:
         socket.open(udp::v4());
         if (opts.buffer_size != 0)
             socket.set_option(decltype(socket)::send_buffer_size(opts.buffer_size));
+    }
+
+    void send_packet(const u_char *data, std::size_t len)
+    {
+        socket.send_to(asio::buffer(data, len), endpoint);
+    }
+
+    void flush()
+    {
+    }
+};
+
+#if USE_SENDMMSG
+class sendmmsg_transmit
+{
+private:
+    static constexpr int batch_size = 8;
+    static constexpr int max_packet_size = 16384;
+    mmsghdr msg_vec[batch_size];
+    iovec msg_iov[batch_size];
+    std::array<u_char, max_packet_size> buffer[batch_size];
+    int next = 0;
+    udp::socket socket;
+    sockaddr_in addr;
+
+public:
+    sendmmsg_transmit(const options &opts, boost::asio::io_service &io_service)
+        : socket(io_service)
+    {
+        udp::resolver resolver(io_service);
+        udp::resolver::query query(udp::v4(), opts.host, opts.port);
+        udp::endpoint endpoint = *resolver.resolve(query);
+
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(endpoint.port());
+        addr.sin_addr.s_addr = htonl(endpoint.address().to_v4().to_ulong());
+        std::memset(&msg_vec, 0, sizeof(msg_vec));
+        for (int i = 0; i < batch_size; i++)
+        {
+            msg_vec[i].msg_hdr.msg_name = &addr;
+            msg_vec[i].msg_hdr.msg_namelen = sizeof(addr);
+            msg_vec[i].msg_hdr.msg_iov = &msg_iov[i];
+            msg_vec[i].msg_hdr.msg_iovlen = 1;
+            msg_iov[i].iov_base = &buffer[i][0];
+        }
+
+        socket.open(udp::v4());
+        if (opts.buffer_size != 0)
+            socket.set_option(decltype(socket)::send_buffer_size(opts.buffer_size));
+    }
+
+    void send_packet(const u_char *data, std::size_t len)
+    {
+        if (len > max_packet_size)
+            throw std::length_error("packet is too big");
+        std::memcpy(&buffer[next][0], data, len);
+        msg_iov[next].iov_len = len;
+        next++;
+        if (next == batch_size)
+            flush();
+    }
+
+    void flush()
+    {
+        int status = sendmmsg(socket.native_handle(), &msg_vec[0], next, 0);
+        if (status != next)
+            throw std::runtime_error("sendmmsg failed: status=" + std::to_string(status));
+        for (int i = 0; i < next; i++)
+            if (msg_vec[i].msg_len != msg_iov[i].iov_len)
+                throw std::runtime_error("short write");
+        next = 0;
+    }
+};
+
+constexpr int sendmmsg_transmit::batch_size;
+#endif
+
+template<typename Transmit>
+class sender
+{
+private:
+    boost::asio::io_service &io_service;
+    Transmit transmit;
+    std::chrono::time_point<std::chrono::high_resolution_clock> start_time;
+    std::chrono::time_point<std::chrono::high_resolution_clock> next_send;
+    std::chrono::nanoseconds pps_interval{0};
+    double ns_per_byte = 0;
+    bool limited = false;
+    std::int64_t bytes = 0;
+
+public:
+    explicit sender(const options &opts, boost::asio::io_service &io_service)
+        : io_service(io_service), transmit(opts, io_service)
+    {
         start_time = next_send = std::chrono::high_resolution_clock::now();
         if (opts.pps != 0)
         {
@@ -77,13 +173,18 @@ public:
             timer.expires_at(next_send);
             timer.wait();
         }
-        socket.send_to(asio::buffer(data, len), endpoint);
+        transmit.send_packet(data, len);
         if (limited)
         {
             next_send += pps_interval;
             next_send += std::chrono::nanoseconds(uint64_t(ns_per_byte * len));
         }
         bytes += len;
+    }
+
+    void flush()
+    {
+        transmit.flush();
     }
 
     std::chrono::high_resolution_clock::duration elapsed() const
@@ -109,10 +210,12 @@ public:
         packets.emplace_back(std::move(buffer));
     }
 
-    void replay(sender &s) const
+    template<typename Sender>
+    void replay(Sender &s) const
     {
         for (const auto &packet : packets)
             s.send_packet(packet.data(), packet.size());
+        s.flush();
     }
 };
 
@@ -166,21 +269,27 @@ static int run(pcap_t *p, const options &opts)
         return 1;
     }
 
+    boost::asio::io_service io_service;
     std::chrono::duration<double> elapsed;
     std::int64_t bytes;
+#if USE_SENDMMSG
+    typedef sender<sendmmsg_transmit> sender_t;
+#else
+    typedef sender<asio_transmit> sender_t;
+#endif
     if (opts.load_first)
     {
         collector c;
         pcap_loop(p, -1, callback<collector>, (u_char *) &c);
-        sender s(opts);
+        sender_t s(opts, io_service);
         c.replay(s);
         elapsed = s.elapsed();
         bytes = s.get_bytes();
     }
     else
     {
-        sender s(opts);
-        pcap_loop(p, -1, callback<sender>, (u_char *) &s);
+        sender_t s(opts, io_service);
+        pcap_loop(p, -1, callback<sender_t>, (u_char *) &s);
         elapsed = s.elapsed();
         bytes = s.get_bytes();
     }
