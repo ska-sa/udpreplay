@@ -11,6 +11,8 @@
 
 #include <iostream>
 #include <memory>
+#include <vector>
+#include <list>
 #include <chrono>
 #include <pcap.h>
 #include <boost/asio.hpp>
@@ -25,20 +27,26 @@ struct options
     double pps = 0;
     double mbps = 0;
     size_t buffer_size = 0;
+    bool load_first = false;
     std::string host = "localhost";
     std::string port = "8888";
     std::string input_file;
 };
 
-struct sender
+class sender
 {
+private:
     boost::asio::io_service io_service;
     udp::socket socket;
     udp::endpoint endpoint;
+    std::chrono::time_point<std::chrono::high_resolution_clock> start_time;
     std::chrono::time_point<std::chrono::high_resolution_clock> next_send;
     std::chrono::nanoseconds pps_interval{0};
     double ns_per_byte = 0;
+    bool limited = false;
+    std::int64_t bytes = 0;
 
+public:
     explicit sender(const options &opts)
         : socket(io_service)
     {
@@ -48,24 +56,67 @@ struct sender
         socket.open(udp::v4());
         if (opts.buffer_size != 0)
             socket.set_option(decltype(socket)::send_buffer_size(opts.buffer_size));
-        next_send = std::chrono::high_resolution_clock::now();
+        start_time = next_send = std::chrono::high_resolution_clock::now();
         if (opts.pps != 0)
+        {
             pps_interval = std::chrono::nanoseconds(uint64_t(1e9 / opts.pps));
+            limited = true;
+        }
         if (opts.mbps != 0)
+        {
             ns_per_byte = 8000.0 / opts.mbps;
+            limited = true;
+        }
     }
 
     void send_packet(const u_char *data, std::size_t len)
     {
-        asio::basic_waitable_timer<std::chrono::high_resolution_clock> timer(io_service);
-        timer.expires_at(next_send);
-        timer.wait();
+        if (limited)
+        {
+            asio::basic_waitable_timer<std::chrono::high_resolution_clock> timer(io_service);
+            timer.expires_at(next_send);
+            timer.wait();
+        }
         socket.send_to(asio::buffer(data, len), endpoint);
-        next_send += pps_interval;
-        next_send += std::chrono::nanoseconds(uint64_t(ns_per_byte * len));
+        if (limited)
+        {
+            next_send += pps_interval;
+            next_send += std::chrono::nanoseconds(uint64_t(ns_per_byte * len));
+        }
+        bytes += len;
+    }
+
+    std::chrono::high_resolution_clock::duration elapsed() const
+    {
+        return std::chrono::high_resolution_clock::now() - start_time;
+    }
+
+    std::int64_t get_bytes() const
+    {
+        return bytes;
     }
 };
 
+class collector
+{
+private:
+    std::list<std::vector<u_char> > packets;
+
+public:
+    void send_packet(const u_char *data, std::size_t len)
+    {
+        std::vector<u_char> buffer(data, data + len);
+        packets.emplace_back(std::move(buffer));
+    }
+
+    void replay(sender &s) const
+    {
+        for (const auto &packet : packets)
+            s.send_packet(packet.data(), packet.size());
+    }
+};
+
+template<typename Handler>
 static void callback(u_char *user, const struct pcap_pkthdr *h, const u_char *bytes)
 {
     const unsigned int eth_hsize = 14;
@@ -88,8 +139,8 @@ static void callback(u_char *user, const struct pcap_pkthdr *h, const u_char *by
             bytes += udp_hsize;
             len -= udp_hsize;
 
-            sender *s = (sender *) user;
-            s->send_packet(bytes, len);
+            Handler *h = (Handler *) user;
+            h->send_packet(bytes, len);
         }
     }
 }
@@ -115,8 +166,27 @@ static int run(pcap_t *p, const options &opts)
         return 1;
     }
 
-    sender s(opts);
-    pcap_loop(p, -1, callback, (u_char *) &s);
+    std::chrono::duration<double> elapsed;
+    std::int64_t bytes;
+    if (opts.load_first)
+    {
+        collector c;
+        pcap_loop(p, -1, callback<collector>, (u_char *) &c);
+        sender s(opts);
+        c.replay(s);
+        elapsed = s.elapsed();
+        bytes = s.get_bytes();
+    }
+    else
+    {
+        sender s(opts);
+        pcap_loop(p, -1, callback<sender>, (u_char *) &s);
+        elapsed = s.elapsed();
+        bytes = s.get_bytes();
+    }
+    double time = elapsed.count();
+    std::cout << "Transmitted " << bytes << " in " << time << "s = "
+        << bytes * 8.0 / time / 1e9 << "Gbps\n";
     return 0;
 }
 
@@ -135,6 +205,7 @@ static options parse_args(int argc, char **argv)
         ("host", po::value<std::string>(&out.host)->default_value(defaults.host), "destination host")
         ("port", po::value<std::string>(&out.port)->default_value(defaults.port), "destination port")
         ("buffer-size", po::value<size_t>(&out.buffer_size)->default_value(defaults.buffer_size), "transmit buffer size (0 for system default)")
+        ("load-first", po::bool_switch(&out.load_first), "load the data from file into memory before sending any packets")
         ;
 
     po::options_description hidden;
