@@ -36,6 +36,7 @@ struct options
     double pps = 0;
     double mbps = 0;
     size_t buffer_size = 0;
+    size_t repeat = 1;
     bool load_first = false;
     std::string host = "localhost";
     std::string port = "8888";
@@ -280,7 +281,8 @@ static int run(pcap_t *p, const options &opts)
         collector c;
         pcap_loop(p, -1, callback<collector>, (u_char *) &c);
         sender_t s(opts, io_service);
-        c.replay(s);
+        for (size_t i = 0; i < opts.repeat; i++)
+            c.replay(s);
         elapsed = s.elapsed();
         bytes = s.get_bytes();
     }
@@ -288,6 +290,7 @@ static int run(pcap_t *p, const options &opts)
     {
         sender_t s(opts, io_service);
         pcap_loop(p, -1, callback<sender_t>, (u_char *) &s);
+        s.flush();
         elapsed = s.elapsed();
         bytes = s.get_bytes();
     }
@@ -313,6 +316,7 @@ static options parse_args(int argc, char **argv)
         ("port", po::value<std::string>(&out.port)->default_value(defaults.port), "destination port")
         ("buffer-size", po::value<size_t>(&out.buffer_size)->default_value(defaults.buffer_size), "transmit buffer size (0 for system default)")
         ("load-first", po::bool_switch(&out.load_first), "load the data from file into memory before sending any packets")
+        ("repeat", po::value<size_t>(&out.repeat)->default_value(defaults.repeat), "send the data this many times (implies --load-first)")
         ;
 
     po::options_description hidden;
@@ -334,6 +338,8 @@ static options parse_args(int argc, char **argv)
         po::notify(vm);
         if (vm.count("pps") && vm.count("mbps"))
             throw po::error("Cannot specify both --pps and --mbps");
+        if (vm.count("repeat"))
+            out.load_first = true;
         return out;
     }
     catch (po::error &e)
