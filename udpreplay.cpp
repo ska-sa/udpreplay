@@ -75,10 +75,9 @@ class sendmmsg_transmit
 {
 private:
     static constexpr int batch_size = 8;
-    static constexpr int max_packet_size = 16384;
+    std::vector<u_char> buffer[batch_size];
     mmsghdr msg_vec[batch_size];
     iovec msg_iov[batch_size];
-    std::array<u_char, max_packet_size> buffer[batch_size];
     int next = 0;
     udp::socket socket;
     sockaddr_in addr;
@@ -101,7 +100,6 @@ public:
             msg_vec[i].msg_hdr.msg_namelen = sizeof(addr);
             msg_vec[i].msg_hdr.msg_iov = &msg_iov[i];
             msg_vec[i].msg_hdr.msg_iovlen = 1;
-            msg_iov[i].iov_base = &buffer[i][0];
         }
 
         socket.open(udp::v4());
@@ -111,9 +109,9 @@ public:
 
     void send_packet(const u_char *data, std::size_t len)
     {
-        if (len > max_packet_size)
-            throw std::length_error("packet is too big");
+        buffer[next].resize(len);
         std::memcpy(&buffer[next][0], data, len);
+        msg_iov[next].iov_base = &buffer[next][0];
         msg_iov[next].iov_len = len;
         next++;
         if (next == batch_size)
