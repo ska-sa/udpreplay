@@ -9,7 +9,7 @@
  * rate if pcap is too slow.
  */
 
-#define USE_SENDMMSG 0
+#define USE_SENDMMSG 1
 
 #if USE_SENDMMSG
 # include <sys/socket.h>
@@ -37,10 +37,16 @@ struct options
     double mbps = 0;
     size_t buffer_size = 0;
     size_t repeat = 1;
-    bool load_first = false;
+    bool parallel = false;
     std::string host = "localhost";
     std::string port = "8888";
     std::string input_file;
+};
+
+struct packet
+{
+    const u_char *data;
+    std::size_t len;
 };
 
 class asio_transmit
@@ -50,6 +56,8 @@ private:
     udp::endpoint endpoint;
 
 public:
+    static constexpr int batch_size = 1;
+
     asio_transmit(const options &opts, boost::asio::io_service &io_service)
         : socket(io_service)
     {
@@ -61,26 +69,24 @@ public:
             socket.set_option(decltype(socket)::send_buffer_size(opts.buffer_size));
     }
 
-    void send_packet(const u_char *data, std::size_t len)
+    template<typename Iterator>
+    void send_packets(Iterator first, Iterator last)
     {
-        socket.send_to(asio::buffer(data, len), endpoint);
-    }
-
-    void flush()
-    {
+        assert(last - first == 1);
+        socket.send_to(asio::buffer(first->data, first->len), endpoint);
     }
 };
 
-#if USE_SENDMMSG
+constexpr int asio_transmit::batch_size;
+
 class sendmmsg_transmit
 {
+public:
+    static constexpr int batch_size = 1;
+
 private:
-    static constexpr int batch_size = 8;
-    std::vector<u_char> buffer[batch_size];
-    mmsghdr msg_vec[batch_size];
-    iovec msg_iov[batch_size];
-    int next = 0;
     udp::socket socket;
+    int fd;
     sockaddr_in addr;
 
 public:
@@ -94,46 +100,44 @@ public:
         addr.sin_family = AF_INET;
         addr.sin_port = htons(endpoint.port());
         addr.sin_addr.s_addr = htonl(endpoint.address().to_v4().to_ulong());
-        std::memset(&msg_vec, 0, sizeof(msg_vec));
-        for (int i = 0; i < batch_size; i++)
-        {
-            msg_vec[i].msg_hdr.msg_name = &addr;
-            msg_vec[i].msg_hdr.msg_namelen = sizeof(addr);
-            msg_vec[i].msg_hdr.msg_iov = &msg_iov[i];
-            msg_vec[i].msg_hdr.msg_iovlen = 1;
-        }
 
         socket.open(udp::v4());
         if (opts.buffer_size != 0)
             socket.set_option(decltype(socket)::send_buffer_size(opts.buffer_size));
+        fd = socket.native_handle();
     }
 
-    void send_packet(const u_char *data, std::size_t len)
+    template<typename Iterator>
+    void send_packets(Iterator first, Iterator last) const
     {
-        buffer[next].resize(len);
-        std::memcpy(&buffer[next][0], data, len);
-        msg_iov[next].iov_base = &buffer[next][0];
-        msg_iov[next].iov_len = len;
-        next++;
-        if (next == batch_size)
-            flush();
-    }
+        mmsghdr msg_vec[batch_size];
+        iovec msg_iov[batch_size];
 
-    void flush()
-    {
-        int status = sendmmsg(socket.native_handle(), &msg_vec[0], next, 0);
+        assert(last - first <= batch_size);
+        int next = 0;
+        std::memset(&msg_vec, 0, sizeof(msg_vec));
+        for (Iterator i = first; i != last; ++i)
+        {
+            msg_vec[next].msg_hdr.msg_name = (void *) &addr;
+            msg_vec[next].msg_hdr.msg_namelen = sizeof(addr);
+            msg_vec[next].msg_hdr.msg_iov = &msg_iov[next];
+            msg_vec[next].msg_hdr.msg_iovlen = 1;
+            msg_iov[next].iov_base = const_cast<u_char *>(i->data);
+            msg_iov[next].iov_len = i->len;
+            next++;
+        }
+        int status = sendmmsg(fd, &msg_vec[0], next, 0);
         if (status != next)
             throw std::runtime_error("sendmmsg failed: status=" + std::to_string(status));
         for (int i = 0; i < next; i++)
             if (msg_vec[i].msg_len != msg_iov[i].iov_len)
                 throw std::runtime_error("short write");
-        next = 0;
     }
 };
 
 constexpr int sendmmsg_transmit::batch_size;
-#endif
 
+/// Wraps a transmitter to rate-limit it
 template<typename Transmit>
 class sender
 {
@@ -145,9 +149,10 @@ private:
     std::chrono::nanoseconds pps_interval{0};
     double ns_per_byte = 0;
     bool limited = false;
-    std::int64_t bytes = 0;
 
 public:
+    static constexpr int batch_size = Transmit::batch_size;
+
     explicit sender(const options &opts, boost::asio::io_service &io_service)
         : io_service(io_service), transmit(opts, io_service)
     {
@@ -164,61 +169,103 @@ public:
         }
     }
 
-    void send_packet(const u_char *data, std::size_t len)
+    template<typename Iterator>
+    void send_packets(Iterator first, Iterator last)
     {
+        std::size_t send_bytes = 0;
+        for (Iterator i = first; i != last; ++i)
+            send_bytes += i->len;
         if (limited)
         {
             asio::basic_waitable_timer<std::chrono::high_resolution_clock> timer(io_service);
             timer.expires_at(next_send);
             timer.wait();
-        }
-        transmit.send_packet(data, len);
-        if (limited)
-        {
+#pragma omp task
+            {
+                transmit.send_packets(first, last);
+            }
             next_send += pps_interval;
-            next_send += std::chrono::nanoseconds(uint64_t(ns_per_byte * len));
+            next_send += std::chrono::nanoseconds(uint64_t(ns_per_byte * send_bytes));
         }
-        bytes += len;
-    }
-
-    void flush()
-    {
-        transmit.flush();
+        else
+        {
+#pragma omp task
+            {
+                transmit.send_packets(first, last);
+            }
+        }
     }
 
     std::chrono::high_resolution_clock::duration elapsed() const
     {
         return std::chrono::high_resolution_clock::now() - start_time;
     }
-
-    std::int64_t get_bytes() const
-    {
-        return bytes;
-    }
 };
 
 class collector
 {
 private:
-    std::list<std::vector<u_char> > packets;
+    std::vector<u_char> storage;
+    std::vector<std::pair<std::size_t, std::size_t> > packet_offsets;
 
 public:
-    void send_packet(const u_char *data, std::size_t len)
+    void add_packet(const packet &p)
     {
-        std::vector<u_char> buffer(data, data + len);
-        packets.emplace_back(std::move(buffer));
+        std::size_t offset = storage.size();
+        storage.insert(storage.end(), p.data, p.data + p.len);
+        packet_offsets.emplace_back(offset, p.len);
     }
 
     template<typename Sender>
-    void replay(Sender &s) const
+    void replay(Sender &s, int repeat) const
     {
-        for (const auto &packet : packets)
-            s.send_packet(packet.data(), packet.size());
-        s.flush();
+        std::array<packet, Sender::batch_size> batch;
+        for (int pass = 0; pass < repeat; pass++)
+        {
+            for (std::size_t i = 0; i < packet_offsets.size(); i += Sender::batch_size)
+            {
+                std::size_t end = std::min(i + Sender::batch_size, packet_offsets.size());
+                std::size_t len = end - i;
+                for (std::size_t j = i; j < end; j++)
+                {
+                    batch[j - i] = packet{storage.data() + packet_offsets[j].first, packet_offsets[j].second};
+                }
+                s.send_packets(batch.begin(), batch.begin() + len);
+            }
+        }
+    }
+
+    template<typename Sender>
+    void replay_mt(Sender &s, int repeat) const
+    {
+        constexpr int batch_size = Sender::batch_size;
+        std::vector<packet> packets;
+        packets.reserve(packet_offsets.size());
+        for (const auto &p : packet_offsets)
+        {
+            packets.push_back(packet{storage.data() + p.first, p.second});
+        }
+#pragma omp parallel
+        {
+#pragma omp master
+            for (int pass = 0; pass < repeat; pass++)
+                {
+                    for (std::size_t i = 0; i < packets.size(); i += batch_size)
+                    {
+                        std::size_t last = std::min(i + batch_size, packets.size());
+                        s.send_packets(packets.begin() + i, packets.begin() + last);
+                    }
+                }
+#pragma omp taskwait
+        }
+    }
+
+    std::size_t get_bytes() const
+    {
+        return storage.size();
     }
 };
 
-template<typename Handler>
 static void callback(u_char *user, const struct pcap_pkthdr *h, const u_char *bytes)
 {
     const unsigned int eth_hsize = 14;
@@ -241,8 +288,9 @@ static void callback(u_char *user, const struct pcap_pkthdr *h, const u_char *by
             bytes += udp_hsize;
             len -= udp_hsize;
 
-            Handler *h = (Handler *) user;
-            h->send_packet(bytes, len);
+            collector *h = (collector *) user;
+            packet p = {bytes, len};
+            h->add_packet(p);
         }
     }
 }
@@ -276,24 +324,18 @@ static int run(pcap_t *p, const options &opts)
 #else
     typedef sender<asio_transmit> sender_t;
 #endif
-    if (opts.load_first)
-    {
-        collector c;
-        pcap_loop(p, -1, callback<collector>, (u_char *) &c);
-        sender_t s(opts, io_service);
-        for (size_t i = 0; i < opts.repeat; i++)
-            c.replay(s);
-        elapsed = s.elapsed();
-        bytes = s.get_bytes();
-    }
+
+    collector c;
+    pcap_loop(p, -1, callback, (u_char *) &c);
+
+    sender_t s(opts, io_service);
+    if (opts.parallel)
+        c.replay_mt(s, opts.repeat);
     else
-    {
-        sender_t s(opts, io_service);
-        pcap_loop(p, -1, callback<sender_t>, (u_char *) &s);
-        s.flush();
-        elapsed = s.elapsed();
-        bytes = s.get_bytes();
-    }
+        c.replay(s, opts.repeat);
+    elapsed = s.elapsed();
+    bytes = c.get_bytes() * opts.repeat;
+
     double time = elapsed.count();
     std::cout << "Transmitted " << bytes << " in " << time << "s = "
         << bytes * 8.0 / time / 1e9 << "Gbps\n";
@@ -315,8 +357,8 @@ static options parse_args(int argc, char **argv)
         ("host", po::value<std::string>(&out.host)->default_value(defaults.host), "destination host")
         ("port", po::value<std::string>(&out.port)->default_value(defaults.port), "destination port")
         ("buffer-size", po::value<size_t>(&out.buffer_size)->default_value(defaults.buffer_size), "transmit buffer size (0 for system default)")
-        ("load-first", po::bool_switch(&out.load_first), "load the data from file into memory before sending any packets")
-        ("repeat", po::value<size_t>(&out.repeat)->default_value(defaults.repeat), "send the data this many times (implies --load-first)")
+        ("repeat", po::value<size_t>(&out.repeat)->default_value(defaults.repeat), "send the data this many times")
+        ("parallel", po::bool_switch(&out.parallel)->default_value(defaults.parallel), "send packets in parallel (MIGHT NOT BE THREADSAFE)")
         ;
 
     po::options_description hidden;
@@ -338,8 +380,6 @@ static options parse_args(int argc, char **argv)
         po::notify(vm);
         if (vm.count("pps") && vm.count("mbps"))
             throw po::error("Cannot specify both --pps and --mbps");
-        if (vm.count("repeat"))
-            out.load_first = true;
         return out;
     }
     catch (po::error &e)
