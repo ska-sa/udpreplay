@@ -49,6 +49,21 @@ struct packet
     std::size_t len;
 };
 
+static void set_buffer_size(udp::socket &socket, std::size_t size)
+{
+    if (size != 0)
+    {
+        socket.set_option(udp::socket::send_buffer_size(size));
+        udp::socket::send_buffer_size actual;
+        socket.get_option(actual);
+        if ((std::size_t) actual.value() != size)
+        {
+            std::cerr << "Warning: requested buffer size of " << size
+                << " but actual size is " << actual.value() << '\n';
+        }
+    }
+}
+
 class asio_transmit
 {
 private:
@@ -65,8 +80,7 @@ public:
         udp::resolver::query query(udp::v4(), opts.host, opts.port);
         endpoint = *resolver.resolve(query);
         socket.open(udp::v4());
-        if (opts.buffer_size != 0)
-            socket.set_option(decltype(socket)::send_buffer_size(opts.buffer_size));
+        set_buffer_size(socket, opts.buffer_size);
     }
 
     template<typename Iterator>
@@ -102,8 +116,7 @@ public:
         addr.sin_addr.s_addr = htonl(endpoint.address().to_v4().to_ulong());
 
         socket.open(udp::v4());
-        if (opts.buffer_size != 0)
-            socket.set_option(decltype(socket)::send_buffer_size(opts.buffer_size));
+        set_buffer_size(socket, opts.buffer_size);
         fd = socket.native_handle();
     }
 
