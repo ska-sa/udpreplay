@@ -5,13 +5,22 @@
  * It supports rate control, either in packets per second or bits per second.
  * It does not support replay at the original speed.
  *
- * It is currently single-threaded, and hence can fall behind the requested
- * rate if pcap is too slow.
+ * The packets are pre-loaded from the pcap file, so it is possible to send at
+ * a higher rate than the packets can be loaded. Typically, the NIC or the
+ * kernel limits the maximum rate.
+ *
+ * It supports sending in parallel, but it is a bit of a hack (uses the same
+ * socket), almost certainly buggy, and seems to give errors.
  */
 
-#define USE_SENDMMSG 1
+// This is a bit hacky, but would need autoconf-style detection to do it right
+#ifdef __linux__
+# define HAVE_SENDMMSG 1
+#else
+# define HAVE_SENDMMSG 0
+#endif
 
-#if USE_SENDMMSG
+#if HAVE_SENDMMSG
 # include <sys/socket.h>
 # include <netinet/in.h>
 # include <netinet/ip.h>
@@ -23,6 +32,8 @@
 #include <list>
 #include <chrono>
 #include <cstring>
+#include <stdexcept>
+#include <system_error>
 #include <pcap.h>
 #include <boost/asio.hpp>
 #include <boost/program_options.hpp>
@@ -37,6 +48,9 @@ struct options
     double mbps = 0;
     size_t buffer_size = 0;
     size_t repeat = 1;
+#if HAVE_SENDMMSG
+    bool sendmmsg = false;
+#endif
     bool parallel = false;
     std::string host = "localhost";
     std::string port = "8888";
@@ -93,10 +107,11 @@ public:
 
 constexpr int asio_transmit::batch_size;
 
+#if HAVE_SENDMMSG
 class sendmmsg_transmit
 {
 public:
-    static constexpr int batch_size = 1;
+    static constexpr int batch_size = 8;
 
 private:
     udp::socket socket;
@@ -141,7 +156,7 @@ public:
         }
         int status = sendmmsg(fd, &msg_vec[0], next, 0);
         if (status != next)
-            throw std::runtime_error("sendmmsg failed: status=" + std::to_string(status));
+            throw std::system_error(errno, std::system_category(), "sendmmsg failed");
         for (int i = 0; i < next; i++)
             if (msg_vec[i].msg_len != msg_iov[i].iov_len)
                 throw std::runtime_error("short write");
@@ -149,6 +164,7 @@ public:
 };
 
 constexpr int sendmmsg_transmit::batch_size;
+#endif
 
 /// Wraps a transmitter to rate-limit it
 template<typename Transmit>
@@ -308,35 +324,22 @@ static void callback(u_char *user, const struct pcap_pkthdr *h, const u_char *by
     }
 }
 
-static int run(pcap_t *p, const options &opts)
+static void prepare(pcap_t *p)
 {
     struct bpf_program fp;
     if (pcap_datalink(p) != DLT_EN10MB)
-    {
-        std::cerr << "Capture does not contain Ethernet frames\n";
-        return 1;
-    }
-
+        throw std::runtime_error("Capture does not contain Ethernet frames");
     if (pcap_compile(p, &fp, "udp", 1, PCAP_NETMASK_UNKNOWN) == -1)
-    {
-        std::cerr << "Failed to parse filter";
-        return 1;
-    }
-
+        throw std::runtime_error("Failed to parse filter");
     if (pcap_setfilter(p, &fp) == -1)
-    {
-        std::cerr << "Failed to set filter\n";
-        return 1;
-    }
+        throw std::runtime_error("Failed to set filter");
+}
 
+template<typename Transmit>
+static void run(pcap_t *p, const options &opts)
+{
     boost::asio::io_service io_service;
-    std::chrono::duration<double> elapsed;
-    std::int64_t bytes;
-#if USE_SENDMMSG
-    typedef sender<sendmmsg_transmit> sender_t;
-#else
-    typedef sender<asio_transmit> sender_t;
-#endif
+    typedef sender<Transmit> sender_t;
 
     collector c;
     pcap_loop(p, -1, callback, (u_char *) &c);
@@ -346,13 +349,12 @@ static int run(pcap_t *p, const options &opts)
         c.replay_mt(s, opts.repeat);
     else
         c.replay(s, opts.repeat);
-    elapsed = s.elapsed();
-    bytes = c.get_bytes() * opts.repeat;
+    std::chrono::duration<double> elapsed = s.elapsed();
+    std::int64_t bytes = c.get_bytes() * opts.repeat;
 
     double time = elapsed.count();
     std::cout << "Transmitted " << bytes << " in " << time << "s = "
         << bytes * 8.0 / time / 1e9 << "Gbps\n";
-    return 0;
 }
 
 static options parse_args(int argc, char **argv)
@@ -369,6 +371,9 @@ static options parse_args(int argc, char **argv)
         ("mbps", po::value<double>(&out.mbps), "bits per second (0 for max speed")
         ("host", po::value<std::string>(&out.host)->default_value(defaults.host), "destination host")
         ("port", po::value<std::string>(&out.port)->default_value(defaults.port), "destination port")
+#if HAVE_SENDMMSG
+        ("sendmmsg", po::bool_switch(&out.sendmmsg)->default_value(defaults.sendmmsg), "use sendmmsg() call")
+#endif
         ("buffer-size", po::value<size_t>(&out.buffer_size)->default_value(defaults.buffer_size), "transmit buffer size (0 for system default)")
         ("repeat", po::value<size_t>(&out.repeat)->default_value(defaults.repeat), "send the data this many times")
         ("parallel", po::bool_switch(&out.parallel)->default_value(defaults.parallel), "send packets in parallel (MIGHT NOT BE THREADSAFE)")
@@ -421,7 +426,17 @@ int main(int argc, char **argv)
     {
         options opts = parse_args(argc, argv);
         std::shared_ptr<pcap_t> p = open_capture(opts);
-        run(p.get(), opts);
+        prepare(p.get());
+#if HAVE_SENDMMSG
+        if (opts.sendmmsg)
+        {
+            run<sendmmsg_transmit>(p.get(), opts);
+        }
+        else
+#endif
+        {
+            run<asio_transmit>(p.get(), opts);
+        }
     }
     catch (po::error &e)
     {
