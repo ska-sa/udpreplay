@@ -129,7 +129,8 @@ private:
 
     void timer_handler(const boost::system::error_code &error)
     {
-        std::cout << packets << " packets\t" << bytes << " bytes\t"
+        std::cout << packets << " packets\t" << bytes << " bytes ("
+            << bytes * 8.0 / 1e9 << " Gb/s)\t"
             << errors << " errors\t" << truncated << " trunc\n";
         packets = 0;
         bytes = 0;
