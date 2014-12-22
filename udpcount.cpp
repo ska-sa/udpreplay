@@ -29,6 +29,7 @@ struct options
     std::string port = "8888";
     std::size_t buffer_size = 0;
     std::size_t packet_size = 16384;
+    int poll = 0;
 };
 
 static options parse_args(int argc, char **argv)
@@ -45,6 +46,7 @@ static options parse_args(int argc, char **argv)
         ("port", po::value<std::string>(&out.port)->default_value(defaults.port), "destination port")
         ("buffer-size", po::value<std::size_t>(&out.buffer_size)->default_value(defaults.buffer_size), "receive buffer size (0 for system default)")
         ("packet-size", po::value<std::size_t>(&out.packet_size)->default_value(defaults.packet_size), "maximum packet size")
+        ("poll", po::value<int>(&out.poll)->default_value(defaults.poll), "make up to this many synchronous reads")
         ;
     try
     {
@@ -73,6 +75,7 @@ private:
     asio::steady_timer timer;
     std::vector<std::uint8_t> buffer;
     udp::endpoint remote;
+    int poll;
     std::int64_t packets = 0;
     std::int64_t bytes = 0;
     std::int64_t truncated = 0;
@@ -106,6 +109,21 @@ private:
             truncated += (bytes_transferred == buffer.size());
             bytes += bytes_transferred;
         }
+        for (int i = 0; i < poll; i++)
+        {
+            boost::system::error_code ec;
+            bytes_transferred = socket.receive_from(asio::buffer(buffer), remote, 0, ec);
+            if (ec == asio::error::would_block)
+                break;
+            else if (ec)
+                errors++;
+            else
+            {
+                packets++;
+                truncated += (bytes_transferred == buffer.size());
+                bytes += bytes_transferred;
+            }
+        }
         enqueue_receive();
     }
 
@@ -123,13 +141,14 @@ private:
 
 public:
     explicit runner(const options &opts)
-        : socket(io_service), timer(io_service), buffer(opts.packet_size)
+        : socket(io_service), timer(io_service), buffer(opts.packet_size), poll(opts.poll)
     {
         udp::resolver resolver(io_service);
         udp::resolver::query query(udp::v4(), opts.host, opts.port);
         auto endpoint = *resolver.resolve(query);
         socket.open(udp::v4());
         socket.bind(endpoint);
+        socket.non_blocking(true);
 
         if (opts.buffer_size != 0)
         {
