@@ -144,7 +144,9 @@ public:
         : socket(io_service), timer(io_service), buffer(opts.packet_size), poll(opts.poll)
     {
         udp::resolver resolver(io_service);
-        udp::resolver::query query(udp::v4(), opts.host, opts.port);
+        udp::resolver::query query(
+            udp::v4(), opts.host, opts.port,
+            udp::resolver::query::passive | udp::resolver::query::address_configured);
         auto endpoint = *resolver.resolve(query);
         socket.open(udp::v4());
         socket.bind(endpoint);
