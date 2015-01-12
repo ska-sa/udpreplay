@@ -27,8 +27,9 @@ struct options
 {
     std::string host = "";
     std::string port = "8888";
-    std::size_t buffer_size = 0;
+    std::size_t socket_size = 0;
     std::size_t packet_size = 16384;
+    std::size_t buffer_size = 0;
     int poll = 0;
 };
 
@@ -44,8 +45,9 @@ static options parse_args(int argc, char **argv)
     desc.add_options()
         ("host", po::value<std::string>(&out.host)->default_value(defaults.host), "destination host")
         ("port", po::value<std::string>(&out.port)->default_value(defaults.port), "destination port")
-        ("buffer-size", po::value<std::size_t>(&out.buffer_size)->default_value(defaults.buffer_size), "receive buffer size (0 for system default)")
+        ("socket-size", po::value<std::size_t>(&out.socket_size)->default_value(defaults.socket_size), "receive buffer size (0 for system default)")
         ("packet-size", po::value<std::size_t>(&out.packet_size)->default_value(defaults.packet_size), "maximum packet size")
+        ("buffer-size", po::value<std::size_t>(&out.buffer_size)->default_value(defaults.buffer_size), "size of receive arena (0 for packet size)")
         ("poll", po::value<int>(&out.poll)->default_value(defaults.poll), "make up to this many synchronous reads")
         ;
     try
@@ -74,10 +76,14 @@ private:
     udp::socket socket;
     asio::steady_timer timer;
     std::vector<std::uint8_t> buffer;
+    const std::size_t packet_size;
+    const int poll;
+    std::size_t offset = 0;
     udp::endpoint remote;
-    int poll;
     std::int64_t packets = 0;
     std::int64_t bytes = 0;
+    std::int64_t total_packets = 0;
+    std::int64_t total_bytes = 0;
     std::int64_t truncated = 0;
     std::int64_t errors = 0;
 
@@ -85,7 +91,7 @@ private:
     {
         using namespace std::placeholders;
         socket.async_receive_from(
-            asio::buffer(buffer),
+            asio::buffer(buffer.data() + offset, packet_size),
             remote,
             std::bind(&runner::packet_handler, this, _1, _2));
     }
@@ -96,40 +102,47 @@ private:
         timer.async_wait(std::bind(&runner::timer_handler, this, _1));
     }
 
+    void update_counters(std::size_t bytes_transferred)
+    {
+        truncated += (bytes_transferred == packet_size);
+        packets++;
+        total_packets++;
+        bytes += bytes_transferred;
+        total_bytes += bytes_transferred;
+        offset += bytes_transferred;
+        // Round up to a cache line offset
+        offset = ((offset + 63) & ~63);
+        if (offset >= buffer.size() - packet_size)
+            offset = 0;
+    }
+
     void packet_handler(const boost::system::error_code &error,
                         std::size_t bytes_transferred)
     {
         if (error)
-        {
             errors++;
-        }
         else
-        {
-            packets++;
-            truncated += (bytes_transferred == buffer.size());
-            bytes += bytes_transferred;
-        }
+            update_counters(bytes_transferred);
         for (int i = 0; i < poll; i++)
         {
             boost::system::error_code ec;
-            bytes_transferred = socket.receive_from(asio::buffer(buffer), remote, 0, ec);
+            bytes_transferred = socket.receive_from(
+                asio::buffer(buffer.data() + offset, packet_size),
+                remote, 0, ec);
             if (ec == asio::error::would_block)
                 break;
             else if (ec)
                 errors++;
             else
-            {
-                packets++;
-                truncated += (bytes_transferred == buffer.size());
-                bytes += bytes_transferred;
-            }
+                update_counters(bytes_transferred);
         }
         enqueue_receive();
     }
 
     void timer_handler(const boost::system::error_code &error)
     {
-        std::cout << packets << " packets\t" << bytes << " bytes ("
+        std::cout << total_packets << " (" << packets << ") packets\t"
+            << total_bytes << " bytes ("
             << bytes * 8.0 / 1e9 << " Gb/s)\t"
             << errors << " errors\t" << truncated << " trunc\n";
         packets = 0;
@@ -142,7 +155,8 @@ private:
 
 public:
     explicit runner(const options &opts)
-        : socket(io_service), timer(io_service), buffer(opts.packet_size), poll(opts.poll)
+        : socket(io_service), timer(io_service),
+        buffer(std::max(opts.packet_size, opts.buffer_size)), packet_size(opts.packet_size), poll(opts.poll)
     {
         udp::resolver resolver(io_service);
         udp::resolver::query query(
@@ -153,14 +167,14 @@ public:
         socket.bind(endpoint);
         socket.non_blocking(true);
 
-        if (opts.buffer_size != 0)
+        if (opts.socket_size != 0)
         {
-            socket.set_option(udp::socket::receive_buffer_size(opts.buffer_size));
+            socket.set_option(udp::socket::receive_buffer_size(opts.socket_size));
             udp::socket::receive_buffer_size actual;
             socket.get_option(actual);
-            if ((std::size_t) actual.value() != opts.buffer_size)
+            if ((std::size_t) actual.value() != opts.socket_size)
             {
-                std::cerr << "Warning: requested buffer size of " << opts.buffer_size
+                std::cerr << "Warning: requested socket buffer size of " << opts.socket_size
                     << " but actual size is " << actual.value() << '\n';
             }
         }
