@@ -367,8 +367,8 @@ static options parse_args(int argc, char **argv)
 
     po::options_description desc;
     desc.add_options()
-        ("pps", po::value<double>(&out.pps), "packets per second (0 for max speed")
-        ("mbps", po::value<double>(&out.mbps), "bits per second (0 for max speed")
+        ("pps", po::value<double>(&out.pps), "packets per second (0 for max speed)")
+        ("mbps", po::value<double>(&out.mbps), "bits per second (0 for max speed)")
         ("host", po::value<std::string>(&out.host)->default_value(defaults.host), "destination host")
         ("port", po::value<std::string>(&out.port)->default_value(defaults.port), "destination port")
 #if HAVE_SENDMMSG
