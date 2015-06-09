@@ -1,4 +1,4 @@
-CXX = g++
+CXX = c++
 CXXFLAGS = -Wall -g -std=c++11 -O2 -fopenmp
 LDFLAGS = -lpcap -lboost_system -lboost_program_options -lpthread -fopenmp
 TARGETS = udpreplay udpcount
