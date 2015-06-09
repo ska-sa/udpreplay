@@ -1,16 +1,17 @@
-/* Replays UDP packets from a pcap dump. Unlike tcpreplay, it only replays the
- * payload and not the headers, so it does not require root privileges and
- * works fine with the Linux loopback device.
+/* Copyright 2015 SKA South Africa
  *
- * It supports rate control, either in packets per second or bits per second.
- * It does not support replay at the original speed.
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- * The packets are pre-loaded from the pcap file, so it is possible to send at
- * a higher rate than the packets can be loaded. Typically, the NIC or the
- * kernel limits the maximum rate.
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
  *
- * It supports sending in parallel, but it is a bit of a hack (uses the same
- * socket), almost certainly buggy, and seems to give errors.
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
 // This is a bit hacky, but would need autoconf-style detection to do it right
