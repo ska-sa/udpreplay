@@ -74,7 +74,7 @@ class runner
 private:
     asio::io_service io_service;
     udp::socket socket;
-    asio::steady_timer timer;
+    asio::basic_waitable_timer<std::chrono::steady_clock> timer;
     std::vector<std::uint8_t> buffer;
     const std::size_t packet_size;
     const int poll;
