@@ -53,7 +53,7 @@ static options parse_args(int argc, char **argv)
         ("packet-size", po::value<std::size_t>(&out.packet_size)->default_value(out.packet_size), "maximum packet size")
         ("buffer-size", po::value<std::size_t>(&out.buffer_size)->default_value(out.buffer_size), "size of receive arena (0 for packet size)")
         ("poll", po::value<int>(&out.poll)->default_value(out.poll), "make up to this many synchronous reads")
-        ("i,interface", po::value<std::string>(&out.pcap_interface)->default_value(out.pcap_interface), "use libpcap on this interface")
+        ("interface,i", po::value<std::string>(&out.pcap_interface)->default_value(out.pcap_interface), "use libpcap on this interface")
         ;
     try
     {
@@ -266,7 +266,6 @@ public:
         program << "udp dst port " << opts.port;
         if (opts.host != "")
             program << " dst " << opts.host;
-        // TODO: put in the real port number
         if (pcap_compile(cap, &fp, program.str().c_str(), 1, PCAP_NETMASK_UNKNOWN) == -1)
             throw std::runtime_error("Failed to parse filter");
         if (pcap_setfilter(cap, &fp) == -1)
