@@ -333,7 +333,11 @@ static void prepare(pcap_t *p)
     if (pcap_compile(p, &fp, "udp", 1, PCAP_NETMASK_UNKNOWN) == -1)
         throw std::runtime_error("Failed to parse filter");
     if (pcap_setfilter(p, &fp) == -1)
+    {
+        pcap_freecode(&fp);
         throw std::runtime_error("Failed to set filter");
+    }
+    pcap_freecode(&fp);
 }
 
 template<typename Transmit>
