@@ -20,9 +20,11 @@
 #include <list>
 #include <chrono>
 #include <cstring>
+#include <sstream>
 #include <boost/asio.hpp>
 #include <boost/asio/steady_timer.hpp>
 #include <boost/program_options.hpp>
+#include <pcap/pcap.h>
 
 namespace asio = boost::asio;
 namespace po = boost::program_options;
@@ -35,25 +37,23 @@ struct options
     std::size_t socket_size = 0;
     std::size_t packet_size = 16384;
     std::size_t buffer_size = 0;
+    std::string pcap_interface = "";
     int poll = 0;
 };
 
 static options parse_args(int argc, char **argv)
 {
-    options defaults;
     options out;
-
-    po::positional_options_description positional;
-    positional.add("input-file", 1);
 
     po::options_description desc;
     desc.add_options()
-        ("host", po::value<std::string>(&out.host)->default_value(defaults.host), "destination host")
-        ("port", po::value<std::string>(&out.port)->default_value(defaults.port), "destination port")
-        ("socket-size", po::value<std::size_t>(&out.socket_size)->default_value(defaults.socket_size), "receive buffer size (0 for system default)")
-        ("packet-size", po::value<std::size_t>(&out.packet_size)->default_value(defaults.packet_size), "maximum packet size")
-        ("buffer-size", po::value<std::size_t>(&out.buffer_size)->default_value(defaults.buffer_size), "size of receive arena (0 for packet size)")
-        ("poll", po::value<int>(&out.poll)->default_value(defaults.poll), "make up to this many synchronous reads")
+        ("host", po::value<std::string>(&out.host)->default_value(out.host), "destination host")
+        ("port", po::value<std::string>(&out.port)->default_value(out.port), "destination port")
+        ("socket-size", po::value<std::size_t>(&out.socket_size)->default_value(out.socket_size), "receive buffer size (0 for system default)")
+        ("packet-size", po::value<std::size_t>(&out.packet_size)->default_value(out.packet_size), "maximum packet size")
+        ("buffer-size", po::value<std::size_t>(&out.buffer_size)->default_value(out.buffer_size), "size of receive arena (0 for packet size)")
+        ("poll", po::value<int>(&out.poll)->default_value(out.poll), "make up to this many synchronous reads")
+        ("i,interface", po::value<std::string>(&out.pcap_interface)->default_value(out.pcap_interface), "use libpcap on this interface")
         ;
     try
     {
@@ -77,6 +77,55 @@ static options parse_args(int argc, char **argv)
 class runner
 {
 private:
+    std::chrono::steady_clock::time_point last_stats;
+    std::vector<std::uint8_t> buffer;
+
+    std::int64_t packets = 0;
+    std::int64_t bytes = 0;
+    std::int64_t total_packets = 0;
+    std::int64_t total_bytes = 0;
+    std::int64_t truncated = 0;
+    std::int64_t errors = 0;
+
+protected:
+    std::chrono::steady_clock::time_point get_last_stats() const
+    {
+        return last_stats;
+    }
+
+    void update_counters(std::size_t bytes_transferred, bool is_truncated)
+    {
+        truncated += is_truncated;
+        packets++;
+        total_packets++;
+        bytes += bytes_transferred;
+        total_bytes += bytes_transferred;
+    }
+
+    void show_stats(std::chrono::steady_clock::time_point now)
+    {
+        typedef std::chrono::duration<double> duration_t;
+        auto elapsed = std::chrono::duration_cast<duration_t>(now - last_stats).count();
+        std::cout << total_packets << " (" << packets / elapsed << ") packets\t"
+            << total_bytes << " bytes ("
+            << bytes * 8.0 / 1e9 / elapsed << " Gb/s)\t"
+            << errors << " errors\t" << truncated << " trunc\n";
+        packets = 0;
+        bytes = 0;
+        errors = 0;
+        truncated = 0;
+        last_stats = now;
+    }
+
+    void add_error()
+    {
+        errors++;
+    }
+};
+
+class socket_runner : public runner
+{
+private:
     asio::io_service io_service;
     udp::socket socket;
     asio::basic_waitable_timer<std::chrono::steady_clock> timer;
@@ -85,12 +134,6 @@ private:
     const int poll;
     std::size_t offset = 0;
     udp::endpoint remote;
-    std::int64_t packets = 0;
-    std::int64_t bytes = 0;
-    std::int64_t total_packets = 0;
-    std::int64_t total_bytes = 0;
-    std::int64_t truncated = 0;
-    std::int64_t errors = 0;
 
     void enqueue_receive()
     {
@@ -98,22 +141,18 @@ private:
         socket.async_receive_from(
             asio::buffer(buffer.data() + offset, packet_size),
             remote,
-            std::bind(&runner::packet_handler, this, _1, _2));
+            std::bind(&socket_runner::packet_handler, this, _1, _2));
     }
 
     void enqueue_wait()
     {
         using namespace std::placeholders;
-        timer.async_wait(std::bind(&runner::timer_handler, this, _1));
+        timer.async_wait(std::bind(&socket_runner::timer_handler, this, _1));
     }
 
     void update_counters(std::size_t bytes_transferred)
     {
-        truncated += (bytes_transferred == packet_size);
-        packets++;
-        total_packets++;
-        bytes += bytes_transferred;
-        total_bytes += bytes_transferred;
+        runner::update_counters(bytes_transferred, bytes_transferred == packet_size);
         offset += bytes_transferred;
         // Round up to a cache line offset
         offset = ((offset + 63) & ~63);
@@ -125,7 +164,7 @@ private:
                         std::size_t bytes_transferred)
     {
         if (error)
-            errors++;
+            add_error();
         else
             update_counters(bytes_transferred);
         for (int i = 0; i < poll; i++)
@@ -137,7 +176,7 @@ private:
             if (ec == asio::error::would_block)
                 break;
             else if (ec)
-                errors++;
+                add_error();
             else
                 update_counters(bytes_transferred);
         }
@@ -146,20 +185,14 @@ private:
 
     void timer_handler(const boost::system::error_code &error)
     {
-        std::cout << total_packets << " (" << packets << ") packets\t"
-            << total_bytes << " bytes ("
-            << bytes * 8.0 / 1e9 << " Gb/s)\t"
-            << errors << " errors\t" << truncated << " trunc\n";
-        packets = 0;
-        bytes = 0;
-        errors = 0;
-        truncated = 0;
+        auto now = timer.expires_at();
+        show_stats(now);
         timer.expires_at(timer.expires_at() + std::chrono::seconds(1));
         enqueue_wait();
     }
 
 public:
-    explicit runner(const options &opts)
+    explicit socket_runner(const options &opts)
         : socket(io_service), timer(io_service),
         buffer(std::max(opts.packet_size, opts.buffer_size)), packet_size(opts.packet_size), poll(opts.poll)
     {
@@ -195,13 +228,120 @@ public:
     }
 };
 
+class pcap_runner : public runner
+{
+private:
+    pcap_t *cap;
+
+    pcap_runner(const pcap_runner &) = delete;
+    pcap_runner &operator=(const pcap_runner &) = delete;
+
+    static void check_status(int status)
+    {
+        if (status != 0)
+            throw std::runtime_error(pcap_statustostr(status));
+    }
+
+public:
+    explicit pcap_runner(const options &opts)
+    {
+        char errbuf[PCAP_ERRBUF_SIZE];
+        cap = pcap_create(opts.pcap_interface.c_str(), errbuf);
+        if (cap == NULL)
+            throw std::runtime_error(std::string(errbuf));
+        check_status(pcap_set_snaplen(cap, opts.packet_size));
+        if (opts.socket_size != 0)
+            check_status(pcap_set_buffer_size(cap, opts.socket_size));
+        check_status(pcap_set_timeout(cap, 10));
+        check_status(pcap_activate(cap));
+        int ret = pcap_set_datalink(cap, DLT_EN10MB);
+        if (ret != 0)
+            throw std::runtime_error(std::string(pcap_geterr(cap)));
+        ret = pcap_setdirection(cap, PCAP_D_IN);
+        if (ret != 0)
+            throw std::runtime_error(std::string(pcap_geterr(cap)));
+
+        struct bpf_program fp;
+        std::ostringstream program;
+        program << "udp dst port " << opts.port;
+        if (opts.host != "")
+            program << " dst " << opts.host;
+        // TODO: put in the real port number
+        if (pcap_compile(cap, &fp, program.str().c_str(), 1, PCAP_NETMASK_UNKNOWN) == -1)
+            throw std::runtime_error("Failed to parse filter");
+        if (pcap_setfilter(cap, &fp) == -1)
+        {
+            pcap_freecode(&fp);
+            throw std::runtime_error(std::string(pcap_geterr(cap)));
+        }
+        pcap_freecode(&fp);
+    }
+
+    ~pcap_runner()
+    {
+        pcap_close(cap);
+    }
+
+    void process_packet(const struct pcap_pkthdr *h, const u_char *bytes)
+    {
+        const unsigned int eth_hsize = 14;
+        bpf_u_int32 len = h->caplen;
+        bool truncated = h->len != len;
+        if (len > eth_hsize)
+        {
+            bytes += eth_hsize;
+            len -= eth_hsize;
+            const unsigned int ip_hsize = (bytes[0] & 0xf) * 4;
+            const unsigned int udp_hsize = 8;
+            if (len >= ip_hsize + udp_hsize)
+                update_counters(len - (ip_hsize + udp_hsize), truncated);
+        }
+    }
+
+    void run()
+    {
+        while (true)
+        {
+            struct pcap_pkthdr *pkt_header;
+            const u_char *pkt_data;
+            int status = pcap_next_ex(cap, &pkt_header, &pkt_data);
+            switch (status)
+            {
+            case 1:
+                // Valid packet
+                process_packet(pkt_header, pkt_data);
+                break;
+            case 0:
+                // Timeout expired; this is harmless
+                break;
+            case -1:
+                // Error
+                throw std::runtime_error(std::string(pcap_geterr(cap)));
+            default:
+                throw std::runtime_error("unexpected return from pcap_next_ex");
+            }
+            auto now = std::chrono::steady_clock::now();
+            if (now - get_last_stats() >= std::chrono::seconds(1))
+                show_stats(now);
+        }
+    }
+};
+
 int main(int argc, char **argv)
 {
     try
     {
         options opts = parse_args(argc, argv);
-        runner r(opts);
-        r.run();
+        if (opts.pcap_interface == "")
+        {
+            socket_runner r(opts);
+            r.run();
+        }
+        else
+        {
+            pcap_runner r(opts);
+            r.run();
+        }
     }
     catch (po::error &e)
     {
