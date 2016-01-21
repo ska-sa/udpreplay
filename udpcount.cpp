@@ -21,10 +21,26 @@
 #include <chrono>
 #include <cstring>
 #include <sstream>
+#include <cerrno>
+#include <atomic>
+#include <thread>
+#include <future>
+#include <system_error>
 #include <boost/asio.hpp>
 #include <boost/asio/steady_timer.hpp>
 #include <boost/program_options.hpp>
 #include <pcap/pcap.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <sys/mman.h>
+#include <net/ethernet.h>
+#include <net/if.h>
+#include <poll.h>
+#include <sched.h>
+#include <linux/if_packet.h>
+#include <linux/if_ether.h>
+#include <linux/ip.h>
+#include <linux/udp.h>
 
 namespace asio = boost::asio;
 namespace po = boost::program_options;
@@ -39,7 +55,13 @@ struct options
     std::size_t buffer_size = 0;
     std::string pcap_interface = "";
     int poll = 0;
+    bool pfpacket = false;
 };
+
+[[noreturn]] static void throw_errno()
+{
+    throw std::system_error(errno, std::system_category());
+}
 
 static options parse_args(int argc, char **argv)
 {
@@ -54,6 +76,7 @@ static options parse_args(int argc, char **argv)
         ("buffer-size", po::value<std::size_t>(&out.buffer_size)->default_value(out.buffer_size), "size of receive arena (0 for packet size)")
         ("poll", po::value<int>(&out.poll)->default_value(out.poll), "make up to this many synchronous reads")
         ("interface,i", po::value<std::string>(&out.pcap_interface)->default_value(out.pcap_interface), "use libpcap on this interface")
+        ("pfpacket", po::bool_switch(&out.pfpacket)->default_value(out.pfpacket), "use low-level PF_PACKET instead of pcap")
         ;
     try
     {
@@ -242,6 +265,22 @@ private:
             throw std::runtime_error(pcap_statustostr(status));
     }
 
+    void process_packet(const struct pcap_pkthdr *h, const u_char *bytes)
+    {
+        const unsigned int eth_hsize = 14;
+        bpf_u_int32 len = h->caplen;
+        bool truncated = h->len != len;
+        if (len > eth_hsize)
+        {
+            bytes += eth_hsize;
+            len -= eth_hsize;
+            const unsigned int ip_hsize = (bytes[0] & 0xf) * 4;
+            const unsigned int udp_hsize = 8;
+            if (len >= ip_hsize + udp_hsize)
+                update_counters(len - (ip_hsize + udp_hsize), truncated);
+        }
+    }
+
 public:
     explicit pcap_runner(const options &opts)
     {
@@ -281,22 +320,6 @@ public:
         pcap_close(cap);
     }
 
-    void process_packet(const struct pcap_pkthdr *h, const u_char *bytes)
-    {
-        const unsigned int eth_hsize = 14;
-        bpf_u_int32 len = h->caplen;
-        bool truncated = h->len != len;
-        if (len > eth_hsize)
-        {
-            bytes += eth_hsize;
-            len -= eth_hsize;
-            const unsigned int ip_hsize = (bytes[0] & 0xf) * 4;
-            const unsigned int udp_hsize = 8;
-            if (len >= ip_hsize + udp_hsize)
-                update_counters(len - (ip_hsize + udp_hsize), truncated);
-        }
-    }
-
     void run()
     {
         while (true)
@@ -326,12 +349,227 @@ public:
     }
 };
 
+template<typename T>
+static void apply_offset(T *&out, void *in, std::ptrdiff_t offset)
+{
+    out = reinterpret_cast<T *>(reinterpret_cast<std::uint8_t *>(in) + offset);
+}
+
+template<typename T>
+static void apply_offset(const T *&out, const void *in, std::ptrdiff_t offset)
+{
+    out = reinterpret_cast<const T *>(reinterpret_cast<const std::uint8_t *>(in) + offset);
+}
+
+class file_descriptor : public boost::noncopyable
+{
+public:
+    int fd;
+
+    explicit file_descriptor(int fd = -1) : fd(fd) {}
+
+    file_descriptor(file_descriptor &&other) : fd(other.fd)
+    {
+        other.fd = -1;
+    }
+
+    ~file_descriptor()
+    {
+        if (fd != -1)
+            close(fd);
+    }
+
+};
+
+class memory_map : public boost::noncopyable
+{
+public:
+    std::uint8_t *ptr;
+    std::size_t length;
+
+    memory_map() : ptr(NULL), length(0) {}
+    memory_map(std::uint8_t *ptr, std::size_t length) : ptr(ptr), length(length) {}
+
+    memory_map(memory_map &&other) : ptr(other.ptr), length(other.length)
+    {
+        other.ptr = NULL;
+        other.length = 0;
+    }
+
+    ~memory_map()
+    {
+        if (ptr != NULL)
+            munmap(ptr, length);
+    }
+};
+
+class pfpacket_runner : public runner
+{
+private:
+    struct thread_data_t
+    {
+        file_descriptor fd;
+        memory_map map;
+    };
+
+    tpacket_req3 ring_req;
+    std::vector<thread_data_t> thread_data;
+
+    void prepare_thread_data(thread_data_t &data, const options &opts)
+    {
+        int status;
+        // Create the socket
+        int fd = socket(PF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
+        if (fd < 0)
+            throw_errno();
+        data.fd.fd = fd;
+        // Bind it to interface
+        if (opts.pcap_interface != "")
+        {
+            ifreq ifr;
+            memset(&ifr, 0, sizeof(ifr));
+            strncpy(ifr.ifr_name, opts.pcap_interface.c_str(), sizeof(ifr.ifr_name));
+            status = ioctl(fd, SIOCGIFINDEX, &ifr);
+            if (status < 0)
+                throw_errno();
+            sockaddr_ll addr;
+            memset(&addr, 0, sizeof(addr));
+            addr.sll_family = AF_PACKET;
+            addr.sll_protocol = htons(ETH_P_ALL);
+            addr.sll_ifindex = ifr.ifr_ifindex;
+            status = bind(fd, (struct sockaddr *) &addr, sizeof(addr));
+            if (status < 0)
+                throw_errno();
+        }
+        // Join the FANOUT group
+        int fanout = (getpid() & 0xffff) | (PACKET_FANOUT_CPU << 16);
+        status = setsockopt(fd, SOL_PACKET, PACKET_FANOUT, &fanout, sizeof(fanout));
+        if (status < 0)
+            throw_errno();
+        // Set to version 3
+        int version = TPACKET_V3;
+        status = setsockopt(fd, SOL_PACKET, PACKET_VERSION, &version, sizeof(version));
+        if (status < 0)
+            throw_errno();
+        // Set up the ring buffer
+        status = setsockopt(fd, SOL_PACKET, PACKET_RX_RING, &ring_req, sizeof(ring_req));
+        if (status < 0)
+            throw_errno();
+        std::size_t length = ring_req.tp_block_size * ring_req.tp_block_nr;
+        void *ptr = mmap(NULL, length, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_LOCKED, fd, 0);
+        if (ptr == NULL)
+            throw_errno();
+        data.map.ptr = (std::uint8_t *) ptr;
+        data.map.length = length;
+    }
+
+    void process_packet(const tpacket3_hdr *header)
+    {
+        bool truncated = header->tp_snaplen != header->tp_len;
+        const ethhdr *eth;
+        const iphdr *ip;
+        apply_offset(eth, header, header->tp_mac);
+        apply_offset(ip, eth, ETH_HLEN);
+        if (eth->h_proto == htons(ETH_P_IP))
+        {
+            // TODO: check for IP options, and IPv6
+            update_counters(header->tp_len - ETH_HLEN - sizeof(iphdr) - sizeof(udphdr), truncated);
+        }
+    }
+
+public:
+    explicit pfpacket_runner(const options &opts)
+    {
+        // Set up ring buffer parameters
+        memset(&ring_req, 0, sizeof(ring_req));
+        ring_req.tp_block_size = 1 << 22;
+        ring_req.tp_frame_size = 1 << 11;
+        ring_req.tp_block_nr = 1 << 6;
+        ring_req.tp_frame_nr = ring_req.tp_block_size / ring_req.tp_frame_size * ring_req.tp_block_nr;
+        ring_req.tp_retire_blk_tov = 10;
+
+        // Create per-thread sockets
+        int threads = std::thread::hardware_concurrency();
+        thread_data.resize(threads);
+        for (int i = 0; i < threads; i++)
+            prepare_thread_data(thread_data[i], opts);
+    }
+
+    void run_thread(thread_data_t &data, int cpu)
+    {
+        cpu_set_t affinity;
+        CPU_ZERO(&affinity);
+        CPU_SET(cpu, &affinity);
+        int status = sched_setaffinity(0, sizeof(affinity), &affinity);
+        if (status < 0)
+            throw_errno();
+
+        unsigned int next_block = 0;
+        pollfd pfd;
+        memset(&pfd, 0, sizeof(pfd));
+        pfd.fd = data.fd.fd;
+        pfd.events = POLLIN | POLLERR;
+        while (true)
+        {
+            tpacket_block_desc *block_desc;
+            apply_offset(block_desc, data.map.ptr, next_block * ring_req.tp_block_size);
+            std::atomic_thread_fence(std::memory_order_acquire);
+            while (!(block_desc->hdr.bh1.block_status & TP_STATUS_USER))
+            {
+                int status = poll(&pfd, 1, -1);
+                if (status < 0)
+                    throw_errno();
+                std::atomic_thread_fence(std::memory_order_acquire);
+            }
+
+            std::size_t num_packets = block_desc->hdr.bh1.num_pkts;
+            tpacket3_hdr *header;
+            apply_offset(header, block_desc, block_desc->hdr.bh1.offset_to_first_pkt);
+            for (std::size_t i = 0; i < num_packets; i++)
+            {
+                process_packet(header);
+                apply_offset(header, header, header->tp_next_offset);
+            }
+
+            block_desc->hdr.bh1.block_status = TP_STATUS_KERNEL;
+            std::atomic_thread_fence(std::memory_order_release);
+            next_block++;
+            if (next_block == ring_req.tp_block_nr)
+                next_block = 0;
+        }
+    }
+
+    void run()
+    {
+        std::vector<std::future<void>> futures;
+        int cpu = 0;
+        for (auto &data : thread_data)
+        {
+            auto call = [&data, cpu, this] { run_thread(data, cpu); };
+            futures.push_back(std::async(std::launch::async, call));
+            cpu++;
+        }
+        auto now = std::chrono::steady_clock::now();
+        while (true)
+        {
+            now += std::chrono::seconds(1);
+            std::this_thread::sleep_until(now);
+            show_stats(now);
+        }
+    }
+};
+
 int main(int argc, char **argv)
 {
     try
     {
         options opts = parse_args(argc, argv);
-        if (opts.pcap_interface == "")
+        if (opts.pfpacket)
+        {
+            pfpacket_runner r(opts);
+            r.run();
+        }
+        else if (opts.pcap_interface == "")
         {
             socket_runner r(opts);
             r.run();
