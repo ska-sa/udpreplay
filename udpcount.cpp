@@ -465,6 +465,7 @@ private:
 
     void process_packet(const tpacket3_hdr *header)
     {
+        // TODO: not thread safe. Accumulate in the loop, then dump sums
         bool truncated = header->tp_snaplen != header->tp_len;
         const ethhdr *eth;
         const iphdr *ip;
