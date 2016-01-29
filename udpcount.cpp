@@ -97,26 +97,28 @@ static options parse_args(int argc, char **argv)
     }
 }
 
-class runner
+template<typename T>
+class metrics
 {
-private:
-    std::chrono::steady_clock::time_point last_stats;
-    std::vector<std::uint8_t> buffer;
+public:
+    T packets;
+    T bytes;
+    T total_packets;
+    T total_bytes;
+    T truncated;
+    T errors;
 
-    std::int64_t packets = 0;
-    std::int64_t bytes = 0;
-    std::int64_t total_packets = 0;
-    std::int64_t total_bytes = 0;
-    std::int64_t truncated = 0;
-    std::int64_t errors = 0;
-
-protected:
-    std::chrono::steady_clock::time_point get_last_stats() const
+    metrics()
     {
-        return last_stats;
+        packets = 0;
+        bytes = 0;
+        total_packets = 0;
+        total_bytes = 0;
+        truncated = 0;
+        errors = 0;
     }
 
-    void update_counters(std::size_t bytes_transferred, bool is_truncated)
+    void add_packet(std::size_t bytes_transferred, bool is_truncated)
     {
         truncated += is_truncated;
         packets++;
@@ -125,28 +127,66 @@ protected:
         total_bytes += bytes_transferred;
     }
 
-    void show_stats(std::chrono::steady_clock::time_point now)
-    {
-        typedef std::chrono::duration<double> duration_t;
-        auto elapsed = std::chrono::duration_cast<duration_t>(now - last_stats).count();
-        std::cout << total_packets << " (" << packets / elapsed << ") packets\t"
-            << total_bytes << " bytes ("
-            << bytes * 8.0 / 1e9 / elapsed << " Gb/s)\t"
-            << errors << " errors\t" << truncated << " trunc\n";
-        packets = 0;
-        bytes = 0;
-        errors = 0;
-        truncated = 0;
-        last_stats = now;
-    }
-
     void add_error()
     {
         errors++;
     }
+
+    void reset()
+    {
+        packets = 0;
+        bytes = 0;
+        errors = 0;
+        truncated = 0;
+    }
+
+    void show_stats(double elapsed)
+    {
+        std::cout << total_packets << " (" << packets / elapsed << ") packets\t"
+            << total_bytes << " bytes ("
+            << bytes * 8.0 / 1e9 / elapsed << " Gb/s)\t"
+            << errors << " errors\t" << truncated << " trunc\n";
+    }
+
+    template<typename U>
+    metrics &operator+=(const metrics<U> &other)
+    {
+        packets += other.packets;
+        bytes += other.bytes;
+        total_packets += other.total_packets;
+        total_bytes += other.total_bytes;
+        truncated += other.truncated;
+        errors += other.errors;
+        return *this;
+    }
 };
 
-class socket_runner : public runner
+template<typename T>
+class runner
+{
+private:
+    std::chrono::steady_clock::time_point last_stats;
+    std::vector<std::uint8_t> buffer;
+
+protected:
+    metrics<T> counters;
+
+    std::chrono::steady_clock::time_point get_last_stats() const
+    {
+        return last_stats;
+    }
+
+    void show_stats(std::chrono::steady_clock::time_point now)
+    {
+        typedef std::chrono::duration<double> duration_t;
+        auto elapsed = std::chrono::duration_cast<duration_t>(now - last_stats).count();
+        counters.show_stats(elapsed);
+        counters.reset();
+        last_stats = now;
+    }
+};
+
+class socket_runner : public runner<std::int64_t>
 {
 private:
     asio::io_service io_service;
@@ -175,7 +215,7 @@ private:
 
     void update_counters(std::size_t bytes_transferred)
     {
-        runner::update_counters(bytes_transferred, bytes_transferred == packet_size);
+        counters.add_packet(bytes_transferred, bytes_transferred == packet_size);
         offset += bytes_transferred;
         // Round up to a cache line offset
         offset = ((offset + 63) & ~63);
@@ -187,7 +227,7 @@ private:
                         std::size_t bytes_transferred)
     {
         if (error)
-            add_error();
+            counters.add_error();
         else
             update_counters(bytes_transferred);
         for (int i = 0; i < poll; i++)
@@ -199,7 +239,7 @@ private:
             if (ec == asio::error::would_block)
                 break;
             else if (ec)
-                add_error();
+                counters.add_error();
             else
                 update_counters(bytes_transferred);
         }
@@ -251,7 +291,7 @@ public:
     }
 };
 
-class pcap_runner : public runner
+class pcap_runner : public runner<std::int64_t>
 {
 private:
     pcap_t *cap;
@@ -277,7 +317,7 @@ private:
             const unsigned int ip_hsize = (bytes[0] & 0xf) * 4;
             const unsigned int udp_hsize = 8;
             if (len >= ip_hsize + udp_hsize)
-                update_counters(len - (ip_hsize + udp_hsize), truncated);
+                counters.add_packet(len - (ip_hsize + udp_hsize), truncated);
         }
     }
 
@@ -403,7 +443,7 @@ public:
     }
 };
 
-class pfpacket_runner : public runner
+class pfpacket_runner : public runner<std::atomic<std::int64_t>>
 {
 private:
     struct thread_data_t
@@ -463,9 +503,8 @@ private:
         data.map.length = length;
     }
 
-    void process_packet(const tpacket3_hdr *header)
+    void process_packet(const tpacket3_hdr *header, metrics<std::int64_t> &local_counters)
     {
-        // TODO: not thread safe. Accumulate in the loop, then dump sums
         bool truncated = header->tp_snaplen != header->tp_len;
         const ethhdr *eth;
         const iphdr *ip;
@@ -474,7 +513,7 @@ private:
         if (eth->h_proto == htons(ETH_P_IP))
         {
             // TODO: check for IP options, and IPv6
-            update_counters(header->tp_len - ETH_HLEN - sizeof(iphdr) - sizeof(udphdr), truncated);
+            local_counters.add_packet(header->tp_len - ETH_HLEN - sizeof(iphdr) - sizeof(udphdr), truncated);
         }
     }
 
@@ -526,11 +565,13 @@ public:
             std::size_t num_packets = block_desc->hdr.bh1.num_pkts;
             tpacket3_hdr *header;
             apply_offset(header, block_desc, block_desc->hdr.bh1.offset_to_first_pkt);
+            metrics<std::int64_t> local_counters;
             for (std::size_t i = 0; i < num_packets; i++)
             {
-                process_packet(header);
+                process_packet(header, local_counters);
                 apply_offset(header, header, header->tp_next_offset);
             }
+            counters += local_counters;
 
             block_desc->hdr.bh1.block_status = TP_STATUS_KERNEL;
             std::atomic_thread_fence(std::memory_order_release);
