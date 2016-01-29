@@ -556,7 +556,7 @@ public:
             std::atomic_thread_fence(std::memory_order_acquire);
             while (!(block_desc->hdr.bh1.block_status & TP_STATUS_USER))
             {
-                int status = poll(&pfd, 1, -1);
+                int status = poll(&pfd, 1, 10);
                 if (status < 0)
                     throw_errno();
                 std::atomic_thread_fence(std::memory_order_acquire);
