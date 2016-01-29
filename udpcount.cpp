@@ -570,8 +570,9 @@ private:
         apply_offset(ip, eth, ETH_HLEN);
         if (eth->h_proto == htons(ETH_P_IP))
         {
-            // TODO: check for IP options, and IPv6
-            local_counters.add_packet(header->tp_len - ETH_HLEN - sizeof(iphdr) - sizeof(udphdr), truncated);
+            const unsigned int ip_hsize = ip->ihl * 4;
+            // TODO: check for IP options
+            local_counters.add_packet(header->tp_len - ETH_HLEN - ip_hsize - sizeof(udphdr), truncated);
         }
     }
 
