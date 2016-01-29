@@ -58,6 +58,7 @@ struct options
     std::string mode = "asio";
     int threads = 0;
     int poll = 0;
+    bool affinity = false;
 };
 
 [[noreturn]] static void throw_errno()
@@ -80,6 +81,7 @@ static options parse_args(int argc, char **argv)
         ("interface,i", po::value<std::string>(&out.interface)->default_value(out.interface), "interface to bind (not all modes)")
         ("mode,m", po::value<std::string>(&out.mode)->default_value(out.mode), "capture mode (asio/pcap/pfpacket)")
         ("threads,t", po::value<int>(&out.threads)->default_value(out.threads), "number of threads (0 for auto) (not all modes)")
+        ("affinity", po::bool_switch(&out.affinity)->default_value(out.affinity), "use CPU affinity (not all modes)")
         ;
     try
     {
@@ -475,6 +477,7 @@ private:
 
     tpacket_req3 ring_req;
     std::vector<thread_data_t> thread_data;
+    bool use_affinity;
 
     void set_packet_filter(int fd)
     {
@@ -593,6 +596,7 @@ private:
 public:
     explicit pfpacket_runner(const options &opts) : socket_runner<std::atomic<std::int64_t>>(opts)
     {
+        use_affinity = opts.affinity;
         // Set up ring buffer parameters
         memset(&ring_req, 0, sizeof(ring_req));
         ring_req.tp_block_size = 1 << 22;
@@ -610,13 +614,15 @@ public:
 
     void run_thread(thread_data_t &data, int cpu)
     {
-        cpu_set_t affinity;
-        CPU_ZERO(&affinity);
-        CPU_SET(cpu, &affinity);
-        int status = sched_setaffinity(0, sizeof(affinity), &affinity);
-        if (status < 0)
-            throw_errno();
-
+        if (use_affinity)
+        {
+            cpu_set_t affinity;
+            CPU_ZERO(&affinity);
+            CPU_SET(cpu, &affinity);
+            int status = sched_setaffinity(0, sizeof(affinity), &affinity);
+            if (status < 0)
+                throw_errno();
+        }
         unsigned int next_block = 0;
         pollfd pfd;
         memset(&pfd, 0, sizeof(pfd));
