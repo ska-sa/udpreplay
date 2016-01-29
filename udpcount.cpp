@@ -606,7 +606,15 @@ public:
         ring_req.tp_retire_blk_tov = 10;
 
         // Create per-thread sockets
-        int threads = opts.threads > 0 ? opts.threads : std::thread::hardware_concurrency();
+        int threads = opts.threads;
+        if (threads == 0)
+        {
+            cpu_set_t affinity;
+            int status = sched_getaffinity(0, sizeof(affinity), &affinity);
+            if (status < 0)
+                throw_errno();
+            threads = CPU_COUNT(&affinity);
+        }
         thread_data.resize(threads);
         for (int i = 0; i < threads; i++)
             prepare_thread_data(thread_data[i], opts);
@@ -614,12 +622,27 @@ public:
 
     void run_thread(thread_data_t &data, int cpu)
     {
+        int status;
         if (use_affinity)
         {
+            cpu_set_t old;
             cpu_set_t affinity;
+            status = sched_getaffinity(0, sizeof(old), &old);
+            if (status < 0)
+                throw_errno();
+            cpu %= CPU_COUNT(&old);
+
+            int hw_cpu = 0;
+            for (int i = 0; i <= cpu; i++)
+            {
+                while (!CPU_ISSET(hw_cpu, &old))
+                    hw_cpu++;
+                CPU_CLR(hw_cpu, &old);
+            }
+
             CPU_ZERO(&affinity);
-            CPU_SET(cpu, &affinity);
-            int status = sched_setaffinity(0, sizeof(affinity), &affinity);
+            CPU_SET(hw_cpu, &affinity);
+            status = sched_setaffinity(0, sizeof(affinity), &affinity);
             if (status < 0)
                 throw_errno();
         }
@@ -635,7 +658,7 @@ public:
             std::atomic_thread_fence(std::memory_order_acquire);
             while (!(block_desc->hdr.bh1.block_status & TP_STATUS_USER))
             {
-                int status = poll(&pfd, 1, 10);
+                status = poll(&pfd, 1, 10);
                 if (status < 0)
                     throw_errno();
                 std::atomic_thread_fence(std::memory_order_acquire);
