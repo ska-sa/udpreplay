@@ -167,10 +167,11 @@ class runner
 {
 private:
     std::chrono::steady_clock::time_point last_stats;
-    std::vector<std::uint8_t> buffer;
 
 protected:
+    asio::io_service io_service;
     metrics<T> counters;
+    udp::endpoint local_endpoint;
 
     std::chrono::steady_clock::time_point get_last_stats() const
     {
@@ -185,13 +186,38 @@ protected:
         counters.reset();
         last_stats = now;
     }
+
+    explicit runner(const options &opts)
+    {
+        udp::resolver resolver(io_service);
+        udp::resolver::query query(
+            udp::v4(), opts.host, opts.port,
+            udp::resolver::query::passive | udp::resolver::query::address_configured);
+        local_endpoint = *resolver.resolve(query);
+    }
 };
 
-class socket_runner : public runner<std::int64_t>
+/* Helper base class that creates and opens a socket. It is used by the basic
+ * asio_runner, but also by pcap_runner and pfpacket_runner to have a socket
+ * open to prevent ICMP connection refused replies even though none of the
+ * data is consumed.
+ */
+template<typename T>
+class socket_runner : public runner<T>
+{
+protected:
+    udp::socket socket;
+
+    explicit socket_runner(const options &opts) : runner<T>(opts), socket(this->io_service)
+    {
+        socket.open(udp::v4());
+        socket.bind(this->local_endpoint);
+    }
+};
+
+class asio_runner : public socket_runner<std::int64_t>
 {
 private:
-    asio::io_service io_service;
-    udp::socket socket;
     asio::basic_waitable_timer<std::chrono::steady_clock> timer;
     std::vector<std::uint8_t> buffer;
     const std::size_t packet_size;
@@ -205,13 +231,13 @@ private:
         socket.async_receive_from(
             asio::buffer(buffer.data() + offset, packet_size),
             remote,
-            std::bind(&socket_runner::packet_handler, this, _1, _2));
+            std::bind(&asio_runner::packet_handler, this, _1, _2));
     }
 
     void enqueue_wait()
     {
         using namespace std::placeholders;
-        timer.async_wait(std::bind(&socket_runner::timer_handler, this, _1));
+        timer.async_wait(std::bind(&asio_runner::timer_handler, this, _1));
     }
 
     void update_counters(std::size_t bytes_transferred)
@@ -256,19 +282,11 @@ private:
     }
 
 public:
-    explicit socket_runner(const options &opts)
-        : socket(io_service), timer(io_service),
+    explicit asio_runner(const options &opts)
+        : socket_runner<std::int64_t>(opts), timer(io_service),
         buffer(std::max(opts.packet_size, opts.buffer_size)), packet_size(opts.packet_size), poll(opts.poll)
     {
-        udp::resolver resolver(io_service);
-        udp::resolver::query query(
-            udp::v4(), opts.host, opts.port,
-            udp::resolver::query::passive | udp::resolver::query::address_configured);
-        auto endpoint = *resolver.resolve(query);
-        socket.open(udp::v4());
-        socket.bind(endpoint);
         socket.non_blocking(true);
-
         if (opts.socket_size != 0)
         {
             socket.set_option(udp::socket::receive_buffer_size(opts.socket_size));
@@ -292,7 +310,7 @@ public:
     }
 };
 
-class pcap_runner : public runner<std::int64_t>
+class pcap_runner : public socket_runner<std::int64_t>
 {
 private:
     pcap_t *cap;
@@ -323,7 +341,7 @@ private:
     }
 
 public:
-    explicit pcap_runner(const options &opts)
+    explicit pcap_runner(const options &opts) : socket_runner<std::int64_t>(opts)
     {
         char errbuf[PCAP_ERRBUF_SIZE];
         cap = pcap_create(opts.pcap_interface.c_str(), errbuf);
@@ -343,9 +361,9 @@ public:
 
         struct bpf_program fp;
         std::ostringstream program;
-        program << "ip and udp dst port " << opts.port;
+        program << "ip and udp dst port " << local_endpoint.port();
         if (opts.host != "")
-            program << " and dst host " << opts.host;
+            program << " and dst host " << local_endpoint.address().to_string();
         if (pcap_compile(cap, &fp, program.str().c_str(), 1, PCAP_NETMASK_UNKNOWN) == -1)
             throw std::runtime_error("Failed to parse filter");
         if (pcap_setfilter(cap, &fp) == -1)
@@ -444,7 +462,7 @@ public:
     }
 };
 
-class pfpacket_runner : public runner<std::atomic<std::int64_t>>
+class pfpacket_runner : public socket_runner<std::atomic<std::int64_t>>
 {
 private:
     struct thread_data_t
@@ -456,7 +474,7 @@ private:
     tpacket_req3 ring_req;
     std::vector<thread_data_t> thread_data;
 
-    void set_packet_filter(int fd, const udp::endpoint &endpoint)
+    void set_packet_filter(int fd)
     {
         sock_filter code_no_host[] =
         {
@@ -468,7 +486,7 @@ private:
             { 0x45, 4, 0, 0x00001fff },
             { 0xb1, 0, 0, 0x0000000e },
             { 0x48, 0, 0, 0x00000010 },
-            { 0x15, 0, 1, endpoint.port() },
+            { 0x15, 0, 1, local_endpoint.port() },
             { 0x6, 0, 0, 0x0000ffff },
             { 0x6, 0, 0, 0x00000000 }
         };
@@ -482,9 +500,9 @@ private:
             { 0x45, 6, 0, 0x00001fff },
             { 0xb1, 0, 0, 0x0000000e },
             { 0x48, 0, 0, 0x00000010 },
-            { 0x15, 0, 3, endpoint.port() },
+            { 0x15, 0, 3, local_endpoint.port() },
             { 0x20, 0, 0, 0x0000001e },
-            { 0x15, 0, 1, (std::uint32_t) endpoint.address().to_v4().to_ulong() },
+            { 0x15, 0, 1, (std::uint32_t) local_endpoint.address().to_v4().to_ulong() },
             { 0x6, 0, 0, 0x0000ffff },
             { 0x6, 0, 0, 0x00000000 },
         };
@@ -498,7 +516,7 @@ private:
             sizeof(code_host) / sizeof(code_host[0]),
             code_host
         };
-        sock_fprog *prog = endpoint.address().is_unspecified() ? &prog_no_host : &prog_host;
+        sock_fprog *prog = local_endpoint.address().is_unspecified() ? &prog_no_host : &prog_host;
         int status = setsockopt(fd, SOL_SOCKET, SO_ATTACH_FILTER, prog, sizeof(*prog));
         if (status < 0)
             throw_errno();
@@ -506,20 +524,14 @@ private:
 
     void prepare_thread_data(thread_data_t &data, const options &opts)
     {
-        asio::io_service io_service;
         int status;
         // Create the socket
-        int fd = socket(PF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
+        int fd = ::socket(PF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
         if (fd < 0)
             throw_errno();
         data.fd.fd = fd;
         // Set up the packet filter.
-        udp::resolver resolver(io_service);
-        udp::resolver::query query(
-            udp::v4(), opts.host, opts.port,
-            udp::resolver::query::passive | udp::resolver::query::address_configured);
-        udp::endpoint endpoint = *resolver.resolve(query);
-        set_packet_filter(fd, endpoint);
+        set_packet_filter(fd);
 
         // Bind it to interface
         if (opts.pcap_interface != "")
@@ -577,7 +589,7 @@ private:
     }
 
 public:
-    explicit pfpacket_runner(const options &opts)
+    explicit pfpacket_runner(const options &opts) : socket_runner<std::atomic<std::int64_t>>(opts)
     {
         // Set up ring buffer parameters
         memset(&ring_req, 0, sizeof(ring_req));
@@ -672,7 +684,7 @@ int main(int argc, char **argv)
         }
         else if (opts.pcap_interface == "")
         {
-            socket_runner r(opts);
+            asio_runner r(opts);
             r.run();
         }
         else
