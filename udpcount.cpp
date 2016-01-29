@@ -54,9 +54,10 @@ struct options
     std::size_t socket_size = 0;
     std::size_t packet_size = 16384;
     std::size_t buffer_size = 0;
-    std::string pcap_interface = "";
+    std::string interface = "";
+    std::string mode = "asio";
+    int threads = 0;
     int poll = 0;
-    bool pfpacket = false;
 };
 
 [[noreturn]] static void throw_errno()
@@ -71,13 +72,14 @@ static options parse_args(int argc, char **argv)
     po::options_description desc;
     desc.add_options()
         ("host", po::value<std::string>(&out.host)->default_value(out.host), "destination host")
-        ("port", po::value<std::string>(&out.port)->default_value(out.port), "destination port")
+        ("port,p", po::value<std::string>(&out.port)->default_value(out.port), "destination port")
         ("socket-size", po::value<std::size_t>(&out.socket_size)->default_value(out.socket_size), "receive buffer size (0 for system default)")
         ("packet-size", po::value<std::size_t>(&out.packet_size)->default_value(out.packet_size), "maximum packet size")
         ("buffer-size", po::value<std::size_t>(&out.buffer_size)->default_value(out.buffer_size), "size of receive arena (0 for packet size)")
         ("poll", po::value<int>(&out.poll)->default_value(out.poll), "make up to this many synchronous reads")
-        ("interface,i", po::value<std::string>(&out.pcap_interface)->default_value(out.pcap_interface), "use libpcap on this interface")
-        ("pfpacket", po::bool_switch(&out.pfpacket)->default_value(out.pfpacket), "use low-level PF_PACKET instead of pcap")
+        ("interface,i", po::value<std::string>(&out.interface)->default_value(out.interface), "interface to bind (not all modes)")
+        ("mode,m", po::value<std::string>(&out.mode)->default_value(out.mode), "capture mode (asio/pcap/pfpacket)")
+        ("threads,t", po::value<int>(&out.threads)->default_value(out.threads), "number of threads (0 for auto) (not all modes)")
         ;
     try
     {
@@ -344,7 +346,7 @@ public:
     explicit pcap_runner(const options &opts) : socket_runner<std::int64_t>(opts)
     {
         char errbuf[PCAP_ERRBUF_SIZE];
-        cap = pcap_create(opts.pcap_interface.c_str(), errbuf);
+        cap = pcap_create(opts.interface.c_str(), errbuf);
         if (cap == NULL)
             throw std::runtime_error(std::string(errbuf));
         check_status(pcap_set_snaplen(cap, opts.packet_size));
@@ -534,11 +536,11 @@ private:
         set_packet_filter(fd);
 
         // Bind it to interface
-        if (opts.pcap_interface != "")
+        if (opts.interface != "")
         {
             ifreq ifr;
             memset(&ifr, 0, sizeof(ifr));
-            strncpy(ifr.ifr_name, opts.pcap_interface.c_str(), sizeof(ifr.ifr_name));
+            strncpy(ifr.ifr_name, opts.interface.c_str(), sizeof(ifr.ifr_name));
             status = ioctl(fd, SIOCGIFINDEX, &ifr);
             if (status < 0)
                 throw_errno();
@@ -600,7 +602,7 @@ public:
         ring_req.tp_retire_blk_tov = 10;
 
         // Create per-thread sockets
-        int threads = std::thread::hardware_concurrency();
+        int threads = opts.threads > 0 ? opts.threads : std::thread::hardware_concurrency();
         thread_data.resize(threads);
         for (int i = 0; i < threads; i++)
             prepare_thread_data(thread_data[i], opts);
@@ -677,20 +679,25 @@ int main(int argc, char **argv)
     try
     {
         options opts = parse_args(argc, argv);
-        if (opts.pfpacket)
+        if (opts.mode == "pfpacket")
         {
             pfpacket_runner r(opts);
             r.run();
         }
-        else if (opts.pcap_interface == "")
+        else if (opts.mode == "pcap")
+        {
+            pcap_runner r(opts);
+            r.run();
+        }
+        else if (opts.mode == "asio")
         {
             asio_runner r(opts);
             r.run();
         }
         else
         {
-            pcap_runner r(opts);
-            r.run();
+            std::cerr << "Mode " << opts.mode << " is not known\n";
+            return 1;
         }
     }
     catch (po::error &e)
