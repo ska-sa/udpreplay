@@ -41,6 +41,7 @@
 #include <linux/if_ether.h>
 #include <linux/ip.h>
 #include <linux/udp.h>
+#include <linux/filter.h>
 
 namespace asio = boost::asio;
 namespace po = boost::program_options;
@@ -342,9 +343,9 @@ public:
 
         struct bpf_program fp;
         std::ostringstream program;
-        program << "udp dst port " << opts.port;
+        program << "ip and udp dst port " << opts.port;
         if (opts.host != "")
-            program << " dst " << opts.host;
+            program << " and dst host " << opts.host;
         if (pcap_compile(cap, &fp, program.str().c_str(), 1, PCAP_NETMASK_UNKNOWN) == -1)
             throw std::runtime_error("Failed to parse filter");
         if (pcap_setfilter(cap, &fp) == -1)
@@ -455,14 +456,71 @@ private:
     tpacket_req3 ring_req;
     std::vector<thread_data_t> thread_data;
 
+    void set_packet_filter(int fd, const udp::endpoint &endpoint)
+    {
+        sock_filter code_no_host[] =
+        {
+            { 0x28, 0, 0, 0x0000000c },
+            { 0x15, 0, 8, 0x00000800 },
+            { 0x30, 0, 0, 0x00000017 },
+            { 0x15, 0, 6, 0x00000011 },
+            { 0x28, 0, 0, 0x00000014 },
+            { 0x45, 4, 0, 0x00001fff },
+            { 0xb1, 0, 0, 0x0000000e },
+            { 0x48, 0, 0, 0x00000010 },
+            { 0x15, 0, 1, endpoint.port() },
+            { 0x6, 0, 0, 0x0000ffff },
+            { 0x6, 0, 0, 0x00000000 }
+        };
+        sock_filter code_host[] =
+        {
+            { 0x28, 0, 0, 0x0000000c },
+            { 0x15, 0, 10, 0x00000800 },
+            { 0x30, 0, 0, 0x00000017 },
+            { 0x15, 0, 8, 0x00000011 },
+            { 0x28, 0, 0, 0x00000014 },
+            { 0x45, 6, 0, 0x00001fff },
+            { 0xb1, 0, 0, 0x0000000e },
+            { 0x48, 0, 0, 0x00000010 },
+            { 0x15, 0, 3, endpoint.port() },
+            { 0x20, 0, 0, 0x0000001e },
+            { 0x15, 0, 1, (std::uint32_t) endpoint.address().to_v4().to_ulong() },
+            { 0x6, 0, 0, 0x0000ffff },
+            { 0x6, 0, 0, 0x00000000 },
+        };
+        sock_fprog prog_no_host =
+        {
+            sizeof(code_no_host) / sizeof(code_no_host[0]),
+            code_no_host
+        };
+        sock_fprog prog_host =
+        {
+            sizeof(code_host) / sizeof(code_host[0]),
+            code_host
+        };
+        sock_fprog *prog = endpoint.address().is_unspecified() ? &prog_no_host : &prog_host;
+        int status = setsockopt(fd, SOL_SOCKET, SO_ATTACH_FILTER, prog, sizeof(*prog));
+        if (status < 0)
+            throw_errno();
+    }
+
     void prepare_thread_data(thread_data_t &data, const options &opts)
     {
+        asio::io_service io_service;
         int status;
         // Create the socket
         int fd = socket(PF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
         if (fd < 0)
             throw_errno();
         data.fd.fd = fd;
+        // Set up the packet filter.
+        udp::resolver resolver(io_service);
+        udp::resolver::query query(
+            udp::v4(), opts.host, opts.port,
+            udp::resolver::query::passive | udp::resolver::query::address_configured);
+        udp::endpoint endpoint = *resolver.resolve(query);
+        set_packet_filter(fd, endpoint);
+
         // Bind it to interface
         if (opts.pcap_interface != "")
         {
