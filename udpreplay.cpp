@@ -185,9 +185,18 @@ constexpr int sendmmsg_transmit::batch_size;
 
 struct freeifaddrs_deleter
 {
-    void operator()(ifaddrs *ifa)
+    void operator()(ifaddrs *ifa) const
     {
         freeifaddrs(ifa);
+    }
+};
+
+
+struct mr_deleter
+{
+    void operator()(ibv_mr *mr) const
+    {
+        ibv_dereg_mr(mr);
     }
 };
 
@@ -247,27 +256,128 @@ static std::array<unsigned char, 6> get_mac(const boost::asio::ip::address &addr
     throw std::runtime_error(std::string("no MAC address found for interface ") + if_name);
 }
 
+static std::array<unsigned char, 6> multicast_mac(const boost::asio::ip::address_v4 &address)
+{
+    std::array<unsigned char, 6> ans;
+    auto bytes = address.to_bytes();
+    std::memcpy(&ans[2], &bytes, 4);
+    ans[0] = 0x01;
+    ans[1] = 0x00;
+    ans[2] = 0x5e;
+    ans[3] &= 0x7f;
+    return ans;
+}
+
+static std::array<unsigned char, 6> multicast_mac(const boost::asio::ip::address &address)
+{
+    return multicast_mac(address.to_v4());
+}
+
 class ibv_transmit
 {
 public:
     static constexpr int batch_size = 64;
 
 private:
+    struct packet
+    {
+        ibv_sge sge{};
+        ibv_send_wr wr{};
+        std::unique_ptr<unsigned char[]> data;
+        std::unique_ptr<ibv_mr, mr_deleter> mr;
+
+        packet(ibv_pd *pd, std::size_t mtu,
+               const std::array<unsigned char, 6> &src_mac,
+               const std::array<unsigned char, 6> &dst_mac,
+               const udp::endpoint &src_endpoint,
+               const udp::endpoint &dst_endpoint)
+            : data(new unsigned char[mtu]),
+            mr(ibv_reg_mr(pd, data.get(), mtu, IBV_ACCESS_LOCAL_WRITE))
+        {
+            if (!mr)
+                throw std::runtime_error("ibv_reg_mr failed");
+            sge.addr = (std::uintptr_t) data.get();
+            sge.lkey = mr->lkey;
+            wr.sg_list = &sge;
+            wr.num_sge = 1;
+            wr.opcode = IBV_WR_SEND;
+            wr.send_flags = 1 << 4; // IBV_SEND_IP_CSUM - not defined in all versions of verbs.h
+
+            memset(data.get(), 0, 42); // Headers
+            // Ethernet header
+            unsigned char *ether = data.get();
+            std::memcpy(ether + 0, &dst_mac, 6);
+            std::memcpy(ether + 6, &src_mac, 6);
+            ether[12] = 0x08; // ETHERTYPE_IP
+            ether[13] = 0x00;
+
+            // IP header
+            unsigned char *ip = ether + 14;
+            ip[0] = 0x45;  // Version 4, header length 20
+            ip[8] = 1;     // TTL
+            ip[9] = 0x11;  // Protocol: UDP
+            auto src_addr = src_endpoint.address().to_v4().to_bytes();
+            auto dst_addr = dst_endpoint.address().to_v4().to_bytes();
+            std::memcpy(ip + 12, &src_addr, sizeof(src_addr));
+            std::memcpy(ip + 16, &dst_addr, sizeof(dst_addr));
+
+            // UDP header
+            unsigned char *udp = ip + 20;
+            std::uint16_t src_port_be = htons(src_endpoint.port());
+            std::uint16_t dst_port_be = htons(dst_endpoint.port());
+            std::memcpy(udp + 0, &src_port_be, sizeof(src_port_be));
+            std::memcpy(udp + 2, &dst_port_be, sizeof(dst_port_be));
+        }
+
+        void set_length(std::size_t length)
+        {
+            if (length > 65507)
+                throw std::length_error("packet is too large");
+            // IP header
+            std::uint16_t length_ip = htons(length + 28);
+            std::memcpy(&data[16], &length_ip, sizeof(length_ip));
+            // UDP header
+            std::uint16_t length_udp = htons(length + 8);
+            std::memcpy(&data[38], &length_udp, sizeof(length_udp));
+            sge.length = length + 42; // TODO: unhardcode
+        }
+
+        void *payload() const
+        {
+            return data.get() + 42;
+        }
+    };
+
     rdma_event_channel *event_channel = nullptr;
     rdma_cm_id *cm_id = nullptr;
     ibv_pd *pd = nullptr;
     ibv_qp *qp = nullptr;
     ibv_cq *cq = nullptr;
-    std::array<unsigned char, 6> mac;
+    mutable std::vector<packet> packets;
+
+    void modify_state(ibv_qp_state state, int port_num = -1)
+    {
+        int flags = IBV_QP_STATE;
+        ibv_qp_attr attr = {};
+        attr.qp_state = state;
+        if (port_num >= 0)
+        {
+            attr.port_num = port_num;
+            flags |= IBV_QP_PORT;
+        }
+        int status = ibv_modify_qp(qp, &attr, flags);
+        if (status != 0)
+            throw std::system_error(status, std::system_category(), "ibv_modify_qp failed");
+    }
 
 public:
     ibv_transmit(const options &opts, boost::asio::io_service &io_service)
     {
         if (opts.bind == "")
             throw std::runtime_error("--bind must be specified with --mode=ibv");
-        auto bind_address = boost::asio::ip::address::from_string(opts.bind);
-        udp::endpoint bind_endpoint(bind_address, 0);
-        mac = get_mac(bind_address);
+        auto src_address = boost::asio::ip::address::from_string(opts.bind);
+        udp::endpoint src_endpoint(src_address, 12345);
+        auto src_mac = get_mac(src_address);
 
         udp::resolver resolver(io_service);
         udp::resolver::query query(udp::v4(), opts.host, opts.port);
@@ -275,22 +385,52 @@ public:
         if (!endpoint.address().is_multicast())
             throw std::runtime_error("Address must be multicast for --mode=ibv");
 
-        if (rdma_bind_addr(cm_id, bind_endpoint.data()) < 0)
-            throw std::system_error(errno, std::system_category(), "rdma_bind_addr failed");
-
         event_channel = rdma_create_event_channel();
         if (!event_channel)
             throw std::system_error(errno, std::system_category(), "rdma_create_event_channel failed");
         if (rdma_create_id(event_channel, &cm_id, NULL, RDMA_PS_UDP) < 0)
             throw std::system_error(errno, std::system_category(), "rdma_create_id failed");
+        if (rdma_bind_addr(cm_id, src_endpoint.data()) < 0)
+            throw std::system_error(errno, std::system_category(), "rdma_bind_addr failed");
+        if (!cm_id->verbs)
+            throw std::runtime_error("rdma_bind_addr did not bind to an RDMA device");
+
+        cq = ibv_create_cq(cm_id->verbs, batch_size, NULL, NULL, 0);
+        if (!cq)
+            throw std::runtime_error("ibv_create_cq failed");
+        pd = ibv_alloc_pd(cm_id->verbs);
+        if (!pd)
+            throw std::runtime_error("ibv_alloc_pd failed");
+
+        ibv_qp_init_attr qp_init_attr = {};
+        qp_init_attr.send_cq = cq;
+        qp_init_attr.recv_cq = cq;
+        qp_init_attr.qp_type = IBV_QPT_RAW_PACKET;
+        qp_init_attr.cap.max_send_wr = batch_size;
+        qp_init_attr.cap.max_recv_wr = 1;
+        qp_init_attr.cap.max_send_sge = 2;
+        qp_init_attr.cap.max_recv_sge = 1;
+        qp = ibv_create_qp(pd, &qp_init_attr);
+        if (!qp)
+            throw std::runtime_error("ibv_create_qp failed");
+
+        // Move to RTS state
+        modify_state(IBV_QPS_INIT, cm_id->port_num);
+        modify_state(IBV_QPS_RTR);
+        modify_state(IBV_QPS_RTS);
+
+        // Prepare packets
+        auto dst_mac = multicast_mac(endpoint.address());
+        for (std::size_t i = 0; i < batch_size; i++)
+            packets.emplace_back(pd, 65535, src_mac, dst_mac, src_endpoint, endpoint);
     }
 
     ~ibv_transmit()
     {
-        if (cq != nullptr)
-            ibv_destroy_cq(cq);
         if (qp != nullptr)
             ibv_destroy_qp(qp);
+        if (cq != nullptr)
+            ibv_destroy_cq(cq);
         if (pd != nullptr)
             ibv_dealloc_pd(pd);
         if (cm_id != nullptr)
@@ -302,6 +442,40 @@ public:
     template<typename Iterator>
     void send_packets(Iterator first, Iterator last) const
     {
+        if (first == last)
+            return;
+        std::size_t idx = 0;
+        for (Iterator cur = first; cur != last; ++cur, ++idx)
+        {
+            std::memcpy(packets[idx].payload(), cur->data, cur->len);
+            packets[idx].set_length(cur->len);
+        }
+        for (std::size_t i = 0; i < idx - 1; i++)
+            packets[idx].wr.next = &packets[idx + 1].wr;
+        packets[idx - 1].wr.next = nullptr;
+        ibv_send_wr *bad;
+        int status = ibv_post_send(qp, &packets[0].wr, &bad);
+        if (status != 0)
+            throw std::system_error(status, std::system_category(), "ibv_post_send failed");
+        std::array<ibv_wc, batch_size> wc;
+        std::size_t rem = idx;
+        while (rem > 0)
+        {
+            int done = ibv_poll_cq(cq, batch_size, wc.data());
+            if (done < 0)
+                throw std::runtime_error("ibv_poll_cq failed");
+            if (done > 0)
+                std::cout << "Returned " << done << " of " << rem << '\n';
+            for (int i = 0; i < done; i++)
+            {
+                if (wc[i].status != IBV_WC_SUCCESS)
+                {
+                    std::cerr << "Failure code " << wc[i].status << '\n';
+                    throw std::runtime_error("send failed");
+                }
+            }
+            rem -= done;
+        }
     }
 };
 
