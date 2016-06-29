@@ -24,15 +24,21 @@
 # define HAVE_IBV 0
 #endif
 
+#if HAVE_IBV
+# include <sys/socket.h>
+# include <rdma/rdma_cma.h>
+# include <infiniband/verbs.h>
+# include <ifaddrs.h>
+# include <sys/types.h>
+# include <net/ethernet.h>
+# include <net/if_arp.h>
+# include <netpacket/packet.h>
+#endif
 #if HAVE_SENDMMSG
 # include <sys/socket.h>
 # include <netinet/in.h>
 # include <netinet/ip.h>
 # include <arpa/inet.h>
-#endif
-#if HAVE_IBV
-# include <rdma/rdma_cma.h>
-# include <infiniband/verbs.h>
 #endif
 #include <iostream>
 #include <memory>
@@ -40,6 +46,7 @@
 #include <list>
 #include <chrono>
 #include <cstring>
+#include <cerrno>
 #include <stdexcept>
 #include <system_error>
 #include <pcap.h>
@@ -60,6 +67,7 @@ struct options
     bool parallel = false;
     std::string host = "localhost";
     std::string port = "8888";
+    std::string bind = "";
     std::string input_file;
 };
 
@@ -174,6 +182,71 @@ constexpr int sendmmsg_transmit::batch_size;
 #endif
 
 #if HAVE_IBV
+
+struct freeifaddrs_deleter
+{
+    void operator()(ifaddrs *ifa)
+    {
+        freeifaddrs(ifa);
+    }
+};
+
+// Finds the MAC address corresponding to an interface IP address
+static std::array<unsigned char, 6> get_mac(const boost::asio::ip::address &address)
+{
+    ifaddrs *ifap;
+    if (getifaddrs(&ifap) < 0)
+        throw std::system_error(errno, std::system_category(), "getifaddrs failed");
+    std::unique_ptr<ifaddrs, freeifaddrs_deleter> ifap_owner(ifap);
+
+    // Map address to an interface name
+    char *if_name = nullptr;
+    for (ifaddrs *cur = ifap; cur; cur = cur->ifa_next)
+    {
+        if (cur->ifa_addr && *(sa_family_t *) cur->ifa_addr == AF_INET && address.is_v4())
+        {
+            const sockaddr_in *cur_address = (const sockaddr_in *) cur->ifa_addr;
+            const auto expected = address.to_v4().to_bytes();
+            if (memcmp(&cur_address->sin_addr, &expected, sizeof(expected)) == 0)
+            {
+                if_name = cur->ifa_name;
+                break;
+            }
+        }
+        else if (cur->ifa_addr && *(sa_family_t *) cur->ifa_addr == AF_INET6 && address.is_v6())
+        {
+            const sockaddr_in6 *cur_address = (const sockaddr_in6 *) cur->ifa_addr;
+            const auto expected = address.to_v6().to_bytes();
+            if (memcmp(&cur_address->sin6_addr, &expected, sizeof(expected)) == 0)
+            {
+                if_name = cur->ifa_name;
+                break;
+            }
+        }
+    }
+    if (!if_name)
+    {
+        throw std::runtime_error("no interface found with the address " + address.to_string());
+    }
+
+    // Now find the MAC address for this interface
+    for (ifaddrs *cur = ifap; cur; cur = cur->ifa_next)
+    {
+        if (strcmp(cur->ifa_name, if_name) == 0
+            && cur->ifa_addr && *(sa_family_t *) cur->ifa_addr == AF_PACKET)
+        {
+            const sockaddr_ll *ll = (sockaddr_ll *) cur->ifa_addr;
+            if (ll->sll_hatype == ARPHRD_ETHER && ll->sll_halen == 6)
+            {
+                std::array<unsigned char, 6> mac;
+                std::memcpy(&mac, ll->sll_addr, 6);
+                return mac;
+            }
+        }
+    }
+    throw std::runtime_error(std::string("no MAC address found for interface ") + if_name);
+}
+
 class ibv_transmit
 {
 public:
@@ -185,34 +258,25 @@ private:
     ibv_pd *pd = nullptr;
     ibv_qp *qp = nullptr;
     ibv_cq *cq = nullptr;
+    std::array<unsigned char, 6> mac;
 
 public:
     ibv_transmit(const options &opts, boost::asio::io_service &io_service)
     {
+        if (opts.bind == "")
+            throw std::runtime_error("--bind must be specified with --mode=ibv");
+        auto bind_address = boost::asio::ip::address::from_string(opts.bind);
+        udp::endpoint bind_endpoint(bind_address, 0);
+        mac = get_mac(bind_address);
+
         udp::resolver resolver(io_service);
         udp::resolver::query query(udp::v4(), opts.host, opts.port);
         udp::endpoint endpoint = *resolver.resolve(query);
         if (!endpoint.address().is_multicast())
             throw std::runtime_error("Address must be multicast for --mode=ibv");
 
-        rdma_addrinfo hints = {};
-        hints.ai_flags = RAI_NUMERICHOST;
-        hints.ai_family = AF_INET;
-        hints.ai_qp_type = IBV_QPT_RAW_PACKET;
-        hints.ai_port_space = RDMA_PS_UDP;
-        hints.ai_dst_len = endpoint.size();
-        hints.ai_dst_addr = endpoint.data();
-        rdma_addrinfo *addrs;
-        if (rdma_getaddrinfo(NULL, NULL, &hints, &addrs) < 0)
-            throw std::system_error(errno, std::system_category(), "rdma_getaddrinfo failed");
-        for (rdma_addrinfo *a = addrs; a; a = a->ai_next)
-        {
-            std::cout << "src len: " << a->ai_src_len << " dst len: " << a->ai_dst_len << '\n';
-        }
-        rdma_freeaddrinfo(addrs);
-
-        //if (rdma_bind_addr(cm_id, &address) < 0)
-        //    throw std::system_error(errno, std::system_category(), "rdma_bind_addr failed");
+        if (rdma_bind_addr(cm_id, bind_endpoint.data()) < 0)
+            throw std::system_error(errno, std::system_category(), "rdma_bind_addr failed");
 
         event_channel = rdma_create_event_channel();
         if (!event_channel)
@@ -453,6 +517,7 @@ static options parse_args(int argc, char **argv)
         ("mbps", po::value<double>(&out.mbps), "bits per second (0 for max speed)")
         ("host", po::value<std::string>(&out.host)->default_value(defaults.host), "destination host")
         ("port", po::value<std::string>(&out.port)->default_value(defaults.port), "destination port")
+        ("bind", po::value<std::string>(&out.bind)->default_value(defaults.bind), "local address (for multicast)")
         ("mode", po::value<std::string>(&out.mode)->default_value(defaults.mode), "transmit mode (asio/sendmmsg/ibv)")
         ("buffer-size", po::value<size_t>(&out.buffer_size)->default_value(defaults.buffer_size), "transmit buffer size (0 for system default)")
         ("repeat", po::value<size_t>(&out.repeat)->default_value(defaults.repeat), "send the data this many times")
