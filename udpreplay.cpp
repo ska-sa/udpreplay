@@ -1,4 +1,4 @@
-/* Copyright 2015 SKA South Africa
+/* Copyright 2015-2016 SKA South Africa
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -20,12 +20,19 @@
 #else
 # define HAVE_SENDMMSG 0
 #endif
+#ifndef HAVE_IBV
+# define HAVE_IBV 0
+#endif
 
 #if HAVE_SENDMMSG
 # include <sys/socket.h>
 # include <netinet/in.h>
 # include <netinet/ip.h>
 # include <arpa/inet.h>
+#endif
+#if HAVE_IBV
+# include <rdma/rdma_cma.h>
+# include <infiniband/verbs.h>
 #endif
 #include <iostream>
 #include <memory>
@@ -49,9 +56,7 @@ struct options
     double mbps = 0;
     size_t buffer_size = 0;
     size_t repeat = 1;
-#if HAVE_SENDMMSG
-    bool sendmmsg = false;
-#endif
+    std::string mode = "asio";
     bool parallel = false;
     std::string host = "localhost";
     std::string port = "8888";
@@ -162,9 +167,81 @@ public:
             if (msg_vec[i].msg_len != msg_iov[i].iov_len)
                 throw std::runtime_error("short write");
     }
+
 };
 
 constexpr int sendmmsg_transmit::batch_size;
+#endif
+
+#if HAVE_IBV
+class ibv_transmit
+{
+public:
+    static constexpr int batch_size = 64;
+
+private:
+    rdma_event_channel *event_channel = nullptr;
+    rdma_cm_id *cm_id = nullptr;
+    ibv_pd *pd = nullptr;
+    ibv_qp *qp = nullptr;
+    ibv_cq *cq = nullptr;
+
+public:
+    ibv_transmit(const options &opts, boost::asio::io_service &io_service)
+    {
+        udp::resolver resolver(io_service);
+        udp::resolver::query query(udp::v4(), opts.host, opts.port);
+        udp::endpoint endpoint = *resolver.resolve(query);
+        if (!endpoint.address().is_multicast())
+            throw std::runtime_error("Address must be multicast for --mode=ibv");
+
+        rdma_addrinfo hints = {};
+        hints.ai_flags = RAI_NUMERICHOST;
+        hints.ai_family = AF_INET;
+        hints.ai_qp_type = IBV_QPT_RAW_PACKET;
+        hints.ai_port_space = RDMA_PS_UDP;
+        hints.ai_dst_len = endpoint.size();
+        hints.ai_dst_addr = endpoint.data();
+        rdma_addrinfo *addrs;
+        if (rdma_getaddrinfo(NULL, NULL, &hints, &addrs) < 0)
+            throw std::system_error(errno, std::system_category(), "rdma_getaddrinfo failed");
+        for (rdma_addrinfo *a = addrs; a; a = a->ai_next)
+        {
+            std::cout << "src len: " << a->ai_src_len << " dst len: " << a->ai_dst_len << '\n';
+        }
+        rdma_freeaddrinfo(addrs);
+
+        //if (rdma_bind_addr(cm_id, &address) < 0)
+        //    throw std::system_error(errno, std::system_category(), "rdma_bind_addr failed");
+
+        event_channel = rdma_create_event_channel();
+        if (!event_channel)
+            throw std::system_error(errno, std::system_category(), "rdma_create_event_channel failed");
+        if (rdma_create_id(event_channel, &cm_id, NULL, RDMA_PS_UDP) < 0)
+            throw std::system_error(errno, std::system_category(), "rdma_create_id failed");
+    }
+
+    ~ibv_transmit()
+    {
+        if (cq != nullptr)
+            ibv_destroy_cq(cq);
+        if (qp != nullptr)
+            ibv_destroy_qp(qp);
+        if (pd != nullptr)
+            ibv_dealloc_pd(pd);
+        if (cm_id != nullptr)
+            rdma_destroy_id(cm_id);
+        if (event_channel != nullptr)
+            rdma_destroy_event_channel(event_channel);
+    }
+
+    template<typename Iterator>
+    void send_packets(Iterator first, Iterator last) const
+    {
+    }
+};
+
+constexpr int ibv_transmit::batch_size;
 #endif
 
 /// Wraps a transmitter to rate-limit it
@@ -376,9 +453,7 @@ static options parse_args(int argc, char **argv)
         ("mbps", po::value<double>(&out.mbps), "bits per second (0 for max speed)")
         ("host", po::value<std::string>(&out.host)->default_value(defaults.host), "destination host")
         ("port", po::value<std::string>(&out.port)->default_value(defaults.port), "destination port")
-#if HAVE_SENDMMSG
-        ("sendmmsg", po::bool_switch(&out.sendmmsg)->default_value(defaults.sendmmsg), "use sendmmsg() call")
-#endif
+        ("mode", po::value<std::string>(&out.mode)->default_value(defaults.mode), "transmit mode (asio/sendmmsg/ibv)")
         ("buffer-size", po::value<size_t>(&out.buffer_size)->default_value(defaults.buffer_size), "transmit buffer size (0 for system default)")
         ("repeat", po::value<size_t>(&out.repeat)->default_value(defaults.repeat), "send the data this many times")
         ("parallel", po::bool_switch(&out.parallel)->default_value(defaults.parallel), "send packets in parallel (MIGHT NOT BE THREADSAFE)")
@@ -433,14 +508,27 @@ int main(int argc, char **argv)
         std::shared_ptr<pcap_t> p = open_capture(opts);
         prepare(p.get());
 #if HAVE_SENDMMSG
-        if (opts.sendmmsg)
+        if (opts.mode == "sendmmsg")
         {
             run<sendmmsg_transmit>(p.get(), opts);
         }
         else
 #endif
+#if HAVE_IBV
+        if (opts.mode == "ibv")
+        {
+            run<ibv_transmit>(p.get(), opts);
+        }
+        else
+#endif
+        if (opts.mode == "asio")
         {
             run<asio_transmit>(p.get(), opts);
+        }
+        else
+        {
+            std::cerr << "Mode '" << opts.mode << "' is not supported\n";
+            return 1;
         }
     }
     catch (po::error &e)
