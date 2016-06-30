@@ -306,8 +306,8 @@ private:
             memset(data.get(), 0, 42); // Headers
             // Ethernet header
             unsigned char *ether = data.get();
-            std::memcpy(ether + 0, &dst_mac, 6);
-            std::memcpy(ether + 6, &src_mac, 6);
+            std::memcpy(ether + 0, &dst_mac, sizeof(dst_mac));
+            std::memcpy(ether + 6, &src_mac, sizeof(src_mac));
             ether[12] = 0x08; // ETHERTYPE_IP
             ether[13] = 0x00;
 
