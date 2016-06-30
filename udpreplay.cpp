@@ -410,6 +410,7 @@ public:
         qp_init_attr.cap.max_recv_wr = 1;
         qp_init_attr.cap.max_send_sge = 2;
         qp_init_attr.cap.max_recv_sge = 1;
+        qp_init_attr.sq_sig_all = 1;
         qp = ibv_create_qp(pd, &qp_init_attr);
         if (!qp)
             throw std::runtime_error("ibv_create_qp failed");
