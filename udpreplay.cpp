@@ -43,7 +43,7 @@
 #include <iostream>
 #include <memory>
 #include <vector>
-#include <list>
+#include <stack>
 #include <chrono>
 #include <cstring>
 #include <cerrno>
@@ -117,6 +117,10 @@ public:
         assert(last - first == 1);
         socket.send_to(asio::buffer(first->data, first->len), endpoint);
     }
+
+    void flush()
+    {
+    }
 };
 
 constexpr int asio_transmit::batch_size;
@@ -176,6 +180,9 @@ public:
                 throw std::runtime_error("short write");
     }
 
+    void flush()
+    {
+    }
 };
 
 constexpr int sendmmsg_transmit::batch_size;
@@ -292,7 +299,8 @@ static uint16_t ip_checksum(const unsigned char *header)
 class ibv_transmit
 {
 public:
-    static constexpr int batch_size = 8;
+    static constexpr int depth = 256;
+    static constexpr int batch_size = 16;
 
 private:
     struct packet
@@ -314,6 +322,7 @@ private:
             data = std::move(other.data);
             mr = std::move(other.mr);
             wr.sg_list = &sge;
+            wr.wr_id = std::uintptr_t(this);
             return *this;
         }
 
@@ -332,6 +341,7 @@ private:
             wr.sg_list = &sge;
             wr.num_sge = 1;
             wr.opcode = IBV_WR_SEND;
+            wr.wr_id = std::uintptr_t(this);
 
             memset(data.get(), 0, 42); // Headers
             // Ethernet header
@@ -390,7 +400,8 @@ private:
     ibv_pd *pd = nullptr;
     ibv_qp *qp = nullptr;
     ibv_cq *cq = nullptr;
-    mutable std::vector<packet> packets;
+    std::vector<packet> packets;
+    std::stack<packet *> available;
 
     void modify_state(ibv_qp_state state, int port_num = -1)
     {
@@ -405,6 +416,27 @@ private:
         int status = ibv_modify_qp(qp, &attr, flags);
         if (status != 0)
             throw std::system_error(status, std::system_category(), "ibv_modify_qp failed");
+    }
+
+    void wait_for_wc()
+    {
+        ibv_wc wc;
+        int status;
+        while ((status = ibv_poll_cq(cq, 1, &wc)) == 0)
+        {
+            // Do nothing
+        }
+        if (status < 0)
+            throw std::runtime_error("ibv_poll_cq failed");
+        if (wc.status != IBV_WC_SUCCESS)
+        {
+            std::cerr << "WC failure: id=" << wc.wr_id
+                << " status=" << wc.status
+                << " vendor_err=" << wc.vendor_err
+                << '\n';
+            throw std::runtime_error("send failed");
+        }
+        available.push((packet *) (std::uintptr_t) wc.wr_id);
     }
 
 public:
@@ -432,7 +464,7 @@ public:
         if (!cm_id->verbs)
             throw std::runtime_error("rdma_bind_addr did not bind to an RDMA device");
 
-        cq = ibv_create_cq(cm_id->verbs, batch_size, NULL, NULL, 0);
+        cq = ibv_create_cq(cm_id->verbs, depth, NULL, NULL, 0);
         if (!cq)
             throw std::runtime_error("ibv_create_cq failed");
         pd = ibv_alloc_pd(cm_id->verbs);
@@ -443,10 +475,11 @@ public:
         qp_init_attr.send_cq = cq;
         qp_init_attr.recv_cq = cq;
         qp_init_attr.qp_type = IBV_QPT_RAW_PACKET;
-        qp_init_attr.cap.max_send_wr = batch_size;
+        qp_init_attr.cap.max_send_wr = depth;
         qp_init_attr.cap.max_recv_wr = 1;
         qp_init_attr.cap.max_send_sge = 2;
         qp_init_attr.cap.max_recv_sge = 1;
+        qp_init_attr.sq_sig_all = 1;
         qp = ibv_create_qp(pd, &qp_init_attr);
         if (!qp)
             throw std::runtime_error("ibv_create_qp failed");
@@ -458,10 +491,11 @@ public:
 
         // Prepare packets
         auto dst_mac = multicast_mac(endpoint.address());
-        for (std::size_t i = 0; i < batch_size; i++)
+        packets.reserve(depth);
+        for (std::size_t i = 0; i < depth; i++)
         {
             packets.emplace_back(pd, 65535, src_mac, dst_mac, src_endpoint, endpoint);
-            packets.back().wr.wr_id = i;
+            available.push(&packets.back());
         }
     }
 
@@ -480,47 +514,44 @@ public:
     }
 
     template<typename Iterator>
-    void send_packets(Iterator first, Iterator last) const
+    void send_packets(Iterator first, Iterator last)
     {
         if (first == last)
             return;
         std::size_t idx = 0;
+        ibv_send_wr *prev = nullptr;
+        ibv_send_wr *first_wr = nullptr;
         for (Iterator cur = first; cur != last; ++cur, ++idx)
         {
-            std::memcpy(packets[idx].payload(), cur->data, cur->len);
-            packets[idx].set_length(cur->len);
-            packets[idx].update_checksum();
+            if (available.empty())
+                wait_for_wc();
+            packet *pkt = available.top();
+            available.pop();
+            std::memcpy(pkt->payload(), cur->data, cur->len);
+            pkt->set_length(cur->len);
+            pkt->update_checksum();
+            if (prev)
+                prev->next = &pkt->wr;
+            else
+                first_wr = &pkt->wr;
+            prev = &pkt->wr;
         }
-        for (std::size_t i = 0; i < idx - 1; i++)
-        {
-            packets[i].wr.next = &packets[i + 1].wr;
-            packets[i].wr.send_flags &= ~IBV_SEND_SIGNALED;
-        }
-        packets[idx - 1].wr.next = nullptr;
-        packets[idx - 1].wr.send_flags |= IBV_SEND_SIGNALED;
+        prev->next = nullptr;
 
         ibv_send_wr *bad;
-        int status = ibv_post_send(qp, &packets[0].wr, &bad);
+        int status = ibv_post_send(qp, first_wr, &bad);
         if (status != 0)
             throw std::system_error(status, std::system_category(), "ibv_post_send failed");
-        ibv_wc wc;
-        while ((status = ibv_poll_cq(cq, 1, &wc)) == 0)
-        {
-            // Do nothing
-        }
-        if (status < 0)
-            throw std::runtime_error("ibv_poll_cq failed");
-        if (wc.status != IBV_WC_SUCCESS)
-        {
-            std::cerr << "WC failure: id=" << wc.wr_id
-                << " status=" << wc.status
-                << " vendor_err=" << wc.vendor_err
-                << '\n';
-            throw std::runtime_error("send failed");
-        }
+    }
+
+    void flush()
+    {
+        while (available.size() < packets.size())
+            wait_for_wc();
     }
 };
 
+constexpr int ibv_transmit::depth;
 constexpr int ibv_transmit::batch_size;
 #endif
 
@@ -583,6 +614,11 @@ public:
         }
     }
 
+    void flush()
+    {
+        transmit.flush();
+    }
+
     std::chrono::high_resolution_clock::duration elapsed() const
     {
         return std::chrono::high_resolution_clock::now() - start_time;
@@ -620,6 +656,7 @@ public:
                 s.send_packets(batch.begin(), batch.begin() + len);
             }
         }
+        s.flush();
     }
 
     template<typename Sender>
