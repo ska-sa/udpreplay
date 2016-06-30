@@ -273,6 +273,22 @@ static std::array<unsigned char, 6> multicast_mac(const boost::asio::ip::address
     return multicast_mac(address.to_v4());
 }
 
+static uint16_t ip_checksum(const unsigned char *header)
+{
+    uint32_t sum = 0;
+    for (int i = 0; i < 20; i += 2)
+    {
+        if (i == 10)
+            continue;   // skip the checksum itself
+        std::uint16_t word;
+        std::memcpy(&word, header + i, sizeof(word));
+        sum += ntohs(word);
+    }
+    while (sum > 0xffff)
+        sum = (sum & 0xffff) + (sum >> 16);
+    return ~htons(sum);
+}
+
 class ibv_transmit
 {
 public:
@@ -316,7 +332,6 @@ private:
             wr.sg_list = &sge;
             wr.num_sge = 1;
             wr.opcode = IBV_WR_SEND;
-            wr.send_flags = 1 << 4; // IBV_SEND_IP_CSUM - not defined in all versions of verbs.h
 
             memset(data.get(), 0, 42); // Headers
             // Ethernet header
@@ -355,6 +370,13 @@ private:
             std::uint16_t length_udp = htons(length + 8);
             std::memcpy(&data[38], &length_udp, sizeof(length_udp));
             sge.length = length + 42; // TODO: unhardcode
+        }
+
+        void update_checksum()
+        {
+            unsigned char *ip = data.get() + 14;
+            uint16_t checksum = ip_checksum(ip);
+            std::memcpy(&ip[10], &checksum, sizeof(checksum));
         }
 
         void *payload() const
@@ -467,6 +489,7 @@ public:
         {
             std::memcpy(packets[idx].payload(), cur->data, cur->len);
             packets[idx].set_length(cur->len);
+            packets[idx].update_checksum();
         }
         for (std::size_t i = 0; i < idx - 1; i++)
         {
