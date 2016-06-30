@@ -451,7 +451,7 @@ public:
             packets[idx].set_length(cur->len);
         }
         for (std::size_t i = 0; i < idx - 1; i++)
-            packets[idx].wr.next = &packets[idx + 1].wr;
+            packets[i].wr.next = &packets[i + 1].wr;
         packets[idx - 1].wr.next = nullptr;
         ibv_send_wr *bad;
         int status = ibv_post_send(qp, &packets[0].wr, &bad);
