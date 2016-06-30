@@ -286,6 +286,21 @@ private:
         std::unique_ptr<unsigned char[]> data;
         std::unique_ptr<ibv_mr, mr_deleter> mr;
 
+        packet(packet &&other) noexcept(true)
+        {
+            *this = std::move(other);
+        }
+
+        packet &operator=(packet &&other) noexcept(true)
+        {
+            sge = std::move(other.sge);
+            wr = std::move(other.wr);
+            data = std::move(other.data);
+            mr = std::move(other.mr);
+            wr.sg_list = &sge;
+            return *this;
+        }
+
         packet(ibv_pd *pd, std::size_t mtu,
                const std::array<unsigned char, 6> &src_mac,
                const std::array<unsigned char, 6> &dst_mac,
