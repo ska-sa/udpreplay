@@ -477,7 +477,7 @@ public:
         qp_init_attr.qp_type = IBV_QPT_RAW_PACKET;
         qp_init_attr.cap.max_send_wr = depth;
         qp_init_attr.cap.max_recv_wr = 1;
-        qp_init_attr.cap.max_send_sge = 2;
+        qp_init_attr.cap.max_send_sge = 1;
         qp_init_attr.cap.max_recv_sge = 1;
         qp_init_attr.sq_sig_all = 1;
         qp = ibv_create_qp(pd, &qp_init_attr);
