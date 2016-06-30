@@ -423,7 +423,10 @@ public:
         // Prepare packets
         auto dst_mac = multicast_mac(endpoint.address());
         for (std::size_t i = 0; i < batch_size; i++)
+        {
             packets.emplace_back(pd, 65535, src_mac, dst_mac, src_endpoint, endpoint);
+            packets.back().wr.wr_id = i;
+        }
     }
 
     ~ibv_transmit()
@@ -471,7 +474,10 @@ public:
             {
                 if (wc[i].status != IBV_WC_SUCCESS)
                 {
-                    std::cerr << "Failure code " << wc[i].status << '\n';
+                    std::cerr << "WC failure: id=" << wc[i].wr_id
+                        << " status=" << wc[i].status
+                        << " vendor_err=" << wc[i].vendor_err
+                        << '\n';
                     throw std::runtime_error("send failed");
                 }
             }
