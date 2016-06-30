@@ -276,7 +276,7 @@ static std::array<unsigned char, 6> multicast_mac(const boost::asio::ip::address
 class ibv_transmit
 {
 public:
-    static constexpr int batch_size = 64;
+    static constexpr int batch_size = 8;
 
 private:
     struct packet
@@ -425,7 +425,6 @@ public:
         qp_init_attr.cap.max_recv_wr = 1;
         qp_init_attr.cap.max_send_sge = 2;
         qp_init_attr.cap.max_recv_sge = 1;
-        qp_init_attr.sq_sig_all = 1;
         qp = ibv_create_qp(pd, &qp_init_attr);
         if (!qp)
             throw std::runtime_error("ibv_create_qp failed");
@@ -470,33 +469,31 @@ public:
             packets[idx].set_length(cur->len);
         }
         for (std::size_t i = 0; i < idx - 1; i++)
+        {
             packets[i].wr.next = &packets[i + 1].wr;
+            packets[i].wr.send_flags &= ~IBV_SEND_SIGNALED;
+        }
         packets[idx - 1].wr.next = nullptr;
+        packets[idx - 1].wr.send_flags |= IBV_SEND_SIGNALED;
+
         ibv_send_wr *bad;
         int status = ibv_post_send(qp, &packets[0].wr, &bad);
         if (status != 0)
             throw std::system_error(status, std::system_category(), "ibv_post_send failed");
-        std::array<ibv_wc, batch_size> wc;
-        std::size_t rem = idx;
-        while (rem > 0)
+        ibv_wc wc;
+        while ((status = ibv_poll_cq(cq, 1, &wc)) == 0)
         {
-            int done = ibv_poll_cq(cq, batch_size, wc.data());
-            if (done < 0)
-                throw std::runtime_error("ibv_poll_cq failed");
-            if (done > 0)
-                std::cout << "Returned " << done << " of " << rem << '\n';
-            for (int i = 0; i < done; i++)
-            {
-                if (wc[i].status != IBV_WC_SUCCESS)
-                {
-                    std::cerr << "WC failure: id=" << wc[i].wr_id
-                        << " status=" << wc[i].status
-                        << " vendor_err=" << wc[i].vendor_err
-                        << '\n';
-                    throw std::runtime_error("send failed");
-                }
-            }
-            rem -= done;
+            // Do nothing
+        }
+        if (status < 0)
+            throw std::runtime_error("ibv_poll_cq failed");
+        if (wc.status != IBV_WC_SUCCESS)
+        {
+            std::cerr << "WC failure: id=" << wc.wr_id
+                << " status=" << wc.status
+                << " vendor_err=" << wc.vendor_err
+                << '\n';
+            throw std::runtime_error("send failed");
         }
     }
 };
