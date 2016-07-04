@@ -29,9 +29,8 @@ libraries for the Boost `system` and `program_options` libraries. You will
 also need a modern C++11-capable compiler. GCC 4.8 and Clang 3.4 are known to
 work.
 
-If your NIC supports the Infiniband Verbs API, including flow steering, you may
-be able to get higher performance by using it. It will be automatically
-detected at configure time.
+If your NIC supports the Infiniband Verbs API, you may be able to get higher
+performance by using it. It will be automatically detected at configure time.
 
 ## Installation
 

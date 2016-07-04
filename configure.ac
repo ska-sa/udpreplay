@@ -36,9 +36,9 @@ AC_CHECK_LIB([pcap], [pcap_fopen_offline], [], [AC_MSG_FAILURE([pcap library not
 # Check for optional features
 AC_CHECK_FUNCS([sendmmsg])
 have_ibv=1
-AC_CHECK_LIB([ibverbs], [ibv_create_flow], [], [have_ibv=0])
+AC_CHECK_LIB([ibverbs], [ibv_get_device_list], [], [have_ibv=0])
 AC_CHECK_LIB([rdmacm], [rdma_create_id], [], [have_ibv=0])
-AC_DEFINE_UNQUOTED([HAVE_IBV], [$have_ibv], [Whether ibverbs API should be supported])
+AC_DEFINE_UNQUOTED([HAVE_IBV], [$have_ibv], [Whether ibverbs API is available])
 
 # Report results
 have_ibv_yesno=yes
