@@ -29,9 +29,6 @@ libraries for the Boost `system` and `program_options` libraries. You will
 also need a modern C++11-capable compiler. GCC 4.8 and Clang 3.4 are known to
 work.
 
-If your NIC supports the Infiniband Verbs API, you may be able to get higher
-performance by using it. It will be automatically detected at configure time.
-
 ## Installation
 
 udpcount uses the standard autoconf/automake flow for installation. If you
@@ -53,7 +50,17 @@ includes the Linux loopback device). Then to replay it at 100Mbps, run
 udpreplay --mbps 100 capture.pcap
 ```
 
-Run `udpreplay -h` to see a list of other options.
+Run `udpreplay -h` to see a list of other options. A particularly useful
+option on Linux is `--mode sendmmsg`, which can increase performance.
+
+## Infiniband Verbs API
+
+If your NIC supports the Infiniband Verbs API, you may be able to get higher
+performance by using it. It will be automatically detected at configure time.
+
+There are some caveats. It can only be used with multicast destination
+addresses, and you must specify the interface to use by passing
+`--bind <ip-address>`.
 
 ## License
 
