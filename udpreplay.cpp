@@ -25,6 +25,7 @@
 # include <net/ethernet.h>
 # include <net/if_arp.h>
 # include <netpacket/packet.h>
+# include <sys/mman.h>
 #endif
 #if HAVE_SENDMMSG
 # include <sys/socket.h>
@@ -198,6 +199,40 @@ struct mr_deleter
     }
 };
 
+template<typename T>
+class mmap_deleter
+{
+private:
+    std::size_t size;
+
+public:
+    mmap_deleter() = default;
+    mmap_deleter(std::size_t size) : size(size) {}
+
+    void operator()(T *ptr) const
+    {
+        munmap(ptr, size);
+    }
+};
+
+static std::unique_ptr<unsigned char[], mmap_deleter<unsigned char>>
+allocate_huge(std::size_t size)
+{
+    int flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB;
+    unsigned char *ptr = (unsigned char *) mmap(
+        nullptr, size, PROT_READ | PROT_WRITE, flags, -1, 0);
+    if (ptr == MAP_FAILED)
+    {
+        std::cerr << "Warning: hugetlb allocation failed, falling back to regular pages\n";
+        flags &= ~MAP_HUGETLB;
+        ptr = (unsigned char *) mmap(
+            nullptr, size, PROT_READ | PROT_WRITE, flags, -1, 0);
+        if (ptr == MAP_FAILED)
+            throw std::bad_alloc();
+    }
+    return {ptr, mmap_deleter<unsigned char>(size)};
+}
+
 // Finds the MAC address corresponding to an interface IP address
 static std::array<unsigned char, 6> get_mac(const boost::asio::ip::address &address)
 {
@@ -298,8 +333,8 @@ private:
     {
         ibv_sge sge{};
         ibv_send_wr wr{};
-        std::unique_ptr<unsigned char[]> data;
-        std::unique_ptr<ibv_mr, mr_deleter> mr;
+        unsigned char *data;
+        std::size_t capacity;
 
         packet(packet &&other) noexcept(true)
         {
@@ -311,32 +346,29 @@ private:
             sge = std::move(other.sge);
             wr = std::move(other.wr);
             data = std::move(other.data);
-            mr = std::move(other.mr);
+            capacity = std::move(other.capacity);
             wr.sg_list = &sge;
             wr.wr_id = std::uintptr_t(this);
             return *this;
         }
 
-        packet(ibv_pd *pd, std::size_t mtu,
+        packet(ibv_mr *mr, unsigned char *data, std::size_t capacity,
                const std::array<unsigned char, 6> &src_mac,
                const std::array<unsigned char, 6> &dst_mac,
                const udp::endpoint &src_endpoint,
                const udp::endpoint &dst_endpoint)
-            : data(new unsigned char[mtu]),
-            mr(ibv_reg_mr(pd, data.get(), mtu, IBV_ACCESS_LOCAL_WRITE))
+            : data(data), capacity(capacity)
         {
-            if (!mr)
-                throw std::runtime_error("ibv_reg_mr failed");
-            sge.addr = (std::uintptr_t) data.get();
+            sge.addr = (std::uintptr_t) data;
             sge.lkey = mr->lkey;
             wr.sg_list = &sge;
             wr.num_sge = 1;
             wr.opcode = IBV_WR_SEND;
             wr.wr_id = std::uintptr_t(this);
 
-            memset(data.get(), 0, 42); // Headers
+            memset(data, 0, 42); // Headers
             // Ethernet header
-            unsigned char *ether = data.get();
+            unsigned char *ether = data;
             std::memcpy(ether + 0, &dst_mac, sizeof(dst_mac));
             std::memcpy(ether + 6, &src_mac, sizeof(src_mac));
             ether[12] = 0x08; // ETHERTYPE_IP
@@ -362,7 +394,7 @@ private:
 
         void set_length(std::size_t length)
         {
-            if (length > 65507)
+            if (length + 42 > capacity)
                 throw std::length_error("packet is too large");
             // IP header
             std::uint16_t length_ip = htons(length + 28);
@@ -375,14 +407,14 @@ private:
 
         void update_checksum()
         {
-            unsigned char *ip = data.get() + 14;
+            unsigned char *ip = data + 14;
             uint16_t checksum = ip_checksum(ip);
             std::memcpy(&ip[10], &checksum, sizeof(checksum));
         }
 
         void *payload() const
         {
-            return data.get() + 42;
+            return data + 42;
         }
     };
 
@@ -393,6 +425,8 @@ private:
     ibv_cq *cq = nullptr;
     std::vector<packet> packets;
     std::stack<packet *> available;
+    std::unique_ptr<unsigned char[], mmap_deleter<unsigned char>> packet_storage;
+    std::unique_ptr<ibv_mr, mr_deleter> mr;
     udp::socket socket; // only to allocate a port number
 
     void modify_state(ibv_qp_state state, int port_num = -1)
@@ -488,10 +522,18 @@ public:
         // Prepare packets
         auto dst_mac = multicast_mac(endpoint.address());
         packets.reserve(depth);
+        const std::size_t capacity = 65536;
+        packet_storage = allocate_huge(depth * capacity);
+        unsigned char *ptr = packet_storage.get();
+        mr.reset(ibv_reg_mr(pd, ptr, depth * capacity,
+                            IBV_ACCESS_LOCAL_WRITE));
+        if (!mr)
+            throw std::runtime_error("ibv_reg_mr failed");
         for (std::size_t i = 0; i < depth; i++)
         {
-            packets.emplace_back(pd, 65535, src_mac, dst_mac, src_endpoint, endpoint);
+            packets.emplace_back(mr.get(), ptr, capacity, src_mac, dst_mac, src_endpoint, endpoint);
             available.push(&packets.back());
+            ptr += capacity;
         }
     }
 
