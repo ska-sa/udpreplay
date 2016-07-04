@@ -14,15 +14,7 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-// This is a bit hacky, but would need autoconf-style detection to do it right
-#ifdef __linux__
-# define HAVE_SENDMMSG 1
-#else
-# define HAVE_SENDMMSG 0
-#endif
-#ifndef HAVE_IBV
-# define HAVE_IBV 0
-#endif
+#include <config.h>
 
 #if HAVE_IBV
 # include <sys/socket.h>
