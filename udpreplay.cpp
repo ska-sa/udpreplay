@@ -439,7 +439,10 @@ public:
         if (opts.bind == "")
             throw std::runtime_error("--bind must be specified with --mode=ibv");
         auto src_address = boost::asio::ip::address::from_string(opts.bind);
-        udp::endpoint src_endpoint(src_address, socket.local_endpoint().port());
+        udp::endpoint src_endpoint(src_address, 0);
+        // Get the OS to assign us a source port
+        socket.bind(src_endpoint);
+        src_endpoint = socket.local_endpoint();
         auto src_mac = get_mac(src_address);
 
         udp::resolver resolver(io_service);
