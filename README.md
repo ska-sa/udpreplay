@@ -29,11 +29,20 @@ libraries for the Boost `system` and `program_options` libraries. You will
 also need a modern C++11-capable compiler. GCC 4.8 and Clang 3.4 are known to
 work.
 
+If your NIC supports the Infiniband Verbs API, including flow steering, you may
+be able to get higher performance by using it. It will be automatically
+detected at configure time.
+
 ## Installation
 
-Simply run `make` to build `udpcount` and `udpreplay`. There is no
-installation; if you like, copy the files to `/usr/local/bin` or wherever
-suits you.
+udpcount uses the standard autoconf/automake flow for installation. If you
+are installing from a git checkout, you should first run `./bootstrap.sh`.
+After that, it is the usual process of
+```sh
+./configure
+make
+sudo make install
+```
 
 ## Usage
 
@@ -42,10 +51,10 @@ tool you prefer. Only ethernet frame types are currently supported (which
 includes the Linux loopback device). Then to replay it at 100Mbps, run
 
 ```sh
-./udpreplay --mbps 100 capture.pcap
+udpreplay --mbps 100 capture.pcap
 ```
 
-Run `./udpreplay -h` to see a list of other options.
+Run `udpreplay -h` to see a list of other options.
 
 ## License
 
