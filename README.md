@@ -31,9 +31,14 @@ work.
 
 ## Installation
 
-Simply run `make` to build `udpcount` and `udpreplay`. There is no
-installation; if you like, copy the files to `/usr/local/bin` or wherever
-suits you.
+udpcount uses the standard autoconf/automake flow for installation. If you
+are installing from a git checkout, you should first run `./bootstrap.sh`.
+After that, it is the usual process of
+```sh
+./configure
+make
+sudo make install
+```
 
 ## Usage
 
@@ -42,10 +47,20 @@ tool you prefer. Only ethernet frame types are currently supported (which
 includes the Linux loopback device). Then to replay it at 100Mbps, run
 
 ```sh
-./udpreplay --mbps 100 capture.pcap
+udpreplay --mbps 100 capture.pcap
 ```
 
-Run `./udpreplay -h` to see a list of other options.
+Run `udpreplay -h` to see a list of other options. A particularly useful
+option on Linux is `--mode sendmmsg`, which can increase performance.
+
+## Infiniband Verbs API
+
+If your NIC supports the Infiniband Verbs API, you may be able to get higher
+performance by using it. It will be automatically detected at configure time.
+
+There are some caveats. It can only be used with multicast destination
+addresses, and you must specify the interface to use by passing
+`--bind <ip-address>`.
 
 ## License
 
