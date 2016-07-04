@@ -56,7 +56,6 @@ struct options
     size_t buffer_size = 0;
     size_t repeat = 1;
     std::string mode = "asio";
-    bool parallel = false;
     std::string host = "localhost";
     std::string port = "8888";
     std::string bind = "";
@@ -587,27 +586,21 @@ public:
     template<typename Iterator>
     void send_packets(Iterator first, Iterator last)
     {
-        std::size_t send_bytes = 0;
-        for (Iterator i = first; i != last; ++i)
-            send_bytes += i->len;
         if (limited)
         {
+            std::size_t send_bytes = 0;
+            for (Iterator i = first; i != last; ++i)
+                send_bytes += i->len;
             asio::basic_waitable_timer<std::chrono::high_resolution_clock> timer(io_service);
             timer.expires_at(next_send);
             timer.wait();
-#pragma omp task
-            {
-                transmit.send_packets(first, last);
-            }
+            transmit.send_packets(first, last);
             next_send += pps_interval;
             next_send += std::chrono::nanoseconds(uint64_t(ns_per_byte * send_bytes));
         }
         else
         {
-#pragma omp task
-            {
-                transmit.send_packets(first, last);
-            }
+            transmit.send_packets(first, last);
         }
     }
 
@@ -654,31 +647,6 @@ public:
             }
         }
         s.flush();
-    }
-
-    template<typename Sender>
-    void replay_mt(Sender &s, int repeat) const
-    {
-        constexpr int batch_size = Sender::batch_size;
-        std::vector<packet> packets;
-        packets.reserve(packet_offsets.size());
-        for (const auto &p : packet_offsets)
-        {
-            packets.push_back(packet{storage.data() + p.first, p.second});
-        }
-#pragma omp parallel
-        {
-#pragma omp master
-            for (int pass = 0; pass < repeat; pass++)
-                {
-                    for (std::size_t i = 0; i < packets.size(); i += batch_size)
-                    {
-                        std::size_t last = std::min(i + batch_size, packets.size());
-                        s.send_packets(packets.begin() + i, packets.begin() + last);
-                    }
-                }
-#pragma omp taskwait
-        }
     }
 
     std::size_t get_bytes() const
@@ -741,10 +709,7 @@ static void run(pcap_t *p, const options &opts)
     pcap_loop(p, -1, callback, (u_char *) &c);
 
     sender_t s(opts, io_service);
-    if (opts.parallel)
-        c.replay_mt(s, opts.repeat);
-    else
-        c.replay(s, opts.repeat);
+    c.replay(s, opts.repeat);
     std::chrono::duration<double> elapsed = s.elapsed();
     std::int64_t bytes = c.get_bytes() * opts.repeat;
 
@@ -771,7 +736,6 @@ static options parse_args(int argc, char **argv)
         ("mode", po::value<std::string>(&out.mode)->default_value(defaults.mode), "transmit mode (asio/sendmmsg/ibv)")
         ("buffer-size", po::value<size_t>(&out.buffer_size)->default_value(defaults.buffer_size), "transmit buffer size (0 for system default)")
         ("repeat", po::value<size_t>(&out.repeat)->default_value(defaults.repeat), "send the data this many times")
-        ("parallel", po::bool_switch(&out.parallel)->default_value(defaults.parallel), "send packets in parallel (MIGHT NOT BE THREADSAFE)")
         ;
 
     po::options_description hidden;

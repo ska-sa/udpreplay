@@ -13,9 +13,6 @@ The packets are pre-loaded from the pcap file, so it is possible to send at a
 higher rate than the packets can be loaded. Typically, the NIC or the kernel
 limits the maximum rate.
 
-It supports sending in parallel, but it is a bit of a hack (uses the same
-socket), almost certainly buggy, and seems to give errors.
-
 ## udpcount
 
 An extra tool is included, called `udpcount`. It listens for UDP packets on a
