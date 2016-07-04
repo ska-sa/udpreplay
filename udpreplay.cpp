@@ -394,6 +394,7 @@ private:
     ibv_cq *cq = nullptr;
     std::vector<packet> packets;
     std::stack<packet *> available;
+    udp::socket socket; // only to allocate a port number
 
     void modify_state(ibv_qp_state state, int port_num = -1)
     {
@@ -433,11 +434,12 @@ private:
 
 public:
     ibv_transmit(const options &opts, boost::asio::io_service &io_service)
+        : socket(io_service, udp::v4())
     {
         if (opts.bind == "")
             throw std::runtime_error("--bind must be specified with --mode=ibv");
         auto src_address = boost::asio::ip::address::from_string(opts.bind);
-        udp::endpoint src_endpoint(src_address, 12345);
+        udp::endpoint src_endpoint(src_address, socket.local_endpoint().port());
         auto src_mac = get_mac(src_address);
 
         udp::resolver resolver(io_service);
