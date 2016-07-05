@@ -184,19 +184,37 @@ constexpr int sendmmsg_transmit::batch_size;
 
 struct freeifaddrs_deleter
 {
-    void operator()(ifaddrs *ifa) const
-    {
-        freeifaddrs(ifa);
-    }
+    void operator()(ifaddrs *ifa) const { freeifaddrs(ifa); }
 };
-
 
 struct mr_deleter
 {
-    void operator()(ibv_mr *mr) const
-    {
-        ibv_dereg_mr(mr);
-    }
+    void operator()(ibv_mr *mr) const { ibv_dereg_mr(mr); }
+};
+
+struct cq_deleter
+{
+    void operator()(ibv_cq *cq) const { ibv_destroy_cq(cq); }
+};
+
+struct qp_deleter
+{
+    void operator()(ibv_qp *qp) const { ibv_destroy_qp(qp); }
+};
+
+struct pd_deleter
+{
+    void operator()(ibv_pd *pd) const { ibv_dealloc_pd(pd); }
+};
+
+struct event_channel_deleter
+{
+    void operator()(rdma_event_channel *event_channel) const { rdma_destroy_event_channel(event_channel); }
+};
+
+struct cm_id_deleter
+{
+    void operator()(rdma_cm_id *cm_id) const { rdma_destroy_id(cm_id); }
 };
 
 template<typename T>
@@ -418,11 +436,11 @@ private:
         }
     };
 
-    rdma_event_channel *event_channel = nullptr;
-    rdma_cm_id *cm_id = nullptr;
-    ibv_pd *pd = nullptr;
-    ibv_qp *qp = nullptr;
-    ibv_cq *cq = nullptr;
+    std::unique_ptr<rdma_event_channel, event_channel_deleter> event_channel;
+    std::unique_ptr<rdma_cm_id, cm_id_deleter> cm_id;
+    std::unique_ptr<ibv_pd, pd_deleter> pd;
+    std::unique_ptr<ibv_qp, qp_deleter> qp;
+    std::unique_ptr<ibv_cq, cq_deleter> cq;
     std::vector<packet> packets;
     std::stack<packet *> available;
     std::unique_ptr<unsigned char[], mmap_deleter<unsigned char>> packet_storage;
@@ -439,7 +457,7 @@ private:
             attr.port_num = port_num;
             flags |= IBV_QP_PORT;
         }
-        int status = ibv_modify_qp(qp, &attr, flags);
+        int status = ibv_modify_qp(qp.get(), &attr, flags);
         if (status != 0)
             throw std::system_error(status, std::system_category(), "ibv_modify_qp failed");
     }
@@ -448,7 +466,7 @@ private:
     {
         ibv_wc wc;
         int status;
-        while ((status = ibv_poll_cq(cq, 1, &wc)) == 0)
+        while ((status = ibv_poll_cq(cq.get(), 1, &wc)) == 0)
         {
             // Do nothing
         }
@@ -484,33 +502,35 @@ public:
         if (!endpoint.address().is_multicast())
             throw std::runtime_error("Address must be multicast for --mode=ibv");
 
-        event_channel = rdma_create_event_channel();
+        event_channel.reset(rdma_create_event_channel());
         if (!event_channel)
             throw std::system_error(errno, std::system_category(), "rdma_create_event_channel failed");
-        if (rdma_create_id(event_channel, &cm_id, NULL, RDMA_PS_UDP) < 0)
+        rdma_cm_id *cm_id_ptr;
+        if (rdma_create_id(event_channel.get(), &cm_id_ptr, NULL, RDMA_PS_UDP) < 0)
             throw std::system_error(errno, std::system_category(), "rdma_create_id failed");
-        if (rdma_bind_addr(cm_id, src_endpoint.data()) < 0)
+        cm_id.reset(cm_id_ptr);
+        if (rdma_bind_addr(cm_id.get(), src_endpoint.data()) < 0)
             throw std::system_error(errno, std::system_category(), "rdma_bind_addr failed");
         if (!cm_id->verbs)
             throw std::runtime_error("rdma_bind_addr did not bind to an RDMA device");
 
-        cq = ibv_create_cq(cm_id->verbs, depth, NULL, NULL, 0);
+        cq.reset(ibv_create_cq(cm_id->verbs, depth, NULL, NULL, 0));
         if (!cq)
             throw std::runtime_error("ibv_create_cq failed");
-        pd = ibv_alloc_pd(cm_id->verbs);
+        pd.reset(ibv_alloc_pd(cm_id->verbs));
         if (!pd)
             throw std::runtime_error("ibv_alloc_pd failed");
 
         ibv_qp_init_attr qp_init_attr = {};
-        qp_init_attr.send_cq = cq;
-        qp_init_attr.recv_cq = cq;
+        qp_init_attr.send_cq = cq.get();
+        qp_init_attr.recv_cq = cq.get();
         qp_init_attr.qp_type = IBV_QPT_RAW_PACKET;
         qp_init_attr.cap.max_send_wr = depth;
         qp_init_attr.cap.max_recv_wr = 1;
         qp_init_attr.cap.max_send_sge = 1;
         qp_init_attr.cap.max_recv_sge = 1;
         qp_init_attr.sq_sig_all = 1;
-        qp = ibv_create_qp(pd, &qp_init_attr);
+        qp.reset(ibv_create_qp(pd.get(), &qp_init_attr));
         if (!qp)
             throw std::runtime_error("ibv_create_qp failed");
 
@@ -525,7 +545,7 @@ public:
         const std::size_t capacity = 65536;
         packet_storage = allocate_huge(depth * capacity);
         unsigned char *ptr = packet_storage.get();
-        mr.reset(ibv_reg_mr(pd, ptr, depth * capacity,
+        mr.reset(ibv_reg_mr(pd.get(), ptr, depth * capacity,
                             IBV_ACCESS_LOCAL_WRITE));
         if (!mr)
             throw std::runtime_error("ibv_reg_mr failed");
@@ -535,20 +555,6 @@ public:
             available.push(&packets.back());
             ptr += capacity;
         }
-    }
-
-    ~ibv_transmit()
-    {
-        if (qp != nullptr)
-            ibv_destroy_qp(qp);
-        if (cq != nullptr)
-            ibv_destroy_cq(cq);
-        if (pd != nullptr)
-            ibv_dealloc_pd(pd);
-        if (cm_id != nullptr)
-            rdma_destroy_id(cm_id);
-        if (event_channel != nullptr)
-            rdma_destroy_event_channel(event_channel);
     }
 
     template<typename Iterator>
@@ -577,7 +583,7 @@ public:
         prev->next = nullptr;
 
         ibv_send_wr *bad;
-        int status = ibv_post_send(qp, first_wr, &bad);
+        int status = ibv_post_send(qp.get(), first_wr, &bad);
         if (status != 0)
             throw std::system_error(status, std::system_category(), "ibv_post_send failed");
     }
