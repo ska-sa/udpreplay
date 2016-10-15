@@ -340,6 +340,12 @@ void ibv_transmit::send_packets(std::size_t first, std::size_t last)
 {
     if (first == last)
         return;
+    if (first == 0 && collector->num_packets() < depth)
+    {
+        // If we wrap the send queue around it could try to send the same
+        // packet twice, which would do bad things.
+        flush();
+    }
     std::size_t idx = 0;
     ibv_send_wr *prev = nullptr;
     ibv_send_wr *first_wr = nullptr;
