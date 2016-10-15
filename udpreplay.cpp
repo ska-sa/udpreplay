@@ -16,693 +16,25 @@
 
 #include <config.h>
 
-#if HAVE_IBV
-# include <sys/socket.h>
-# include <rdma/rdma_cma.h>
-# include <infiniband/verbs.h>
-# include <ifaddrs.h>
-# include <sys/types.h>
-# include <net/ethernet.h>
-# include <net/if_arp.h>
-# include <netpacket/packet.h>
-# include <sys/mman.h>
-#endif
-#if HAVE_SENDMMSG
-# include <sys/socket.h>
-# include <netinet/in.h>
-# include <netinet/ip.h>
-# include <arpa/inet.h>
-#endif
 #include <iostream>
 #include <memory>
 #include <vector>
-#include <stack>
 #include <chrono>
-#include <cstring>
-#include <cerrno>
 #include <stdexcept>
 #include <system_error>
 #include <pcap.h>
-#include <boost/asio.hpp>
 #include <boost/program_options.hpp>
+#include "common.h"
+#include "asio_transmit.h"
+#include "sendmmsg_transmit.h"
+#include "ibv_transmit.h"
+#include "rate_transmit.h"
 
 namespace asio = boost::asio;
 namespace po = boost::program_options;
 using boost::asio::ip::udp;
 
-struct options
-{
-    double pps = 0;
-    double mbps = 0;
-    size_t buffer_size = 0;
-    size_t repeat = 1;
-    std::string mode = "asio";
-    std::string host = "localhost";
-    std::string port = "8888";
-    std::string bind = "";
-    std::string input_file;
-};
-
-struct packet
-{
-    const u_char *data;
-    std::size_t len;
-};
-
-static void set_buffer_size(udp::socket &socket, std::size_t size)
-{
-    if (size != 0)
-    {
-        socket.set_option(udp::socket::send_buffer_size(size));
-        udp::socket::send_buffer_size actual;
-        socket.get_option(actual);
-        if ((std::size_t) actual.value() != size)
-        {
-            std::cerr << "Warning: requested buffer size of " << size
-                << " but actual size is " << actual.value() << '\n';
-        }
-    }
-}
-
-class asio_transmit
-{
-private:
-    udp::socket socket;
-    udp::endpoint endpoint;
-
-public:
-    static constexpr int batch_size = 1;
-
-    asio_transmit(const options &opts, boost::asio::io_service &io_service)
-        : socket(io_service)
-    {
-        udp::resolver resolver(io_service);
-        udp::resolver::query query(udp::v4(), opts.host, opts.port);
-        endpoint = *resolver.resolve(query);
-        socket.open(udp::v4());
-        set_buffer_size(socket, opts.buffer_size);
-    }
-
-    template<typename Iterator>
-    void send_packets(Iterator first, Iterator last)
-    {
-        assert(last - first == 1);
-        socket.send_to(asio::buffer(first->data, first->len), endpoint);
-    }
-
-    void flush()
-    {
-    }
-};
-
-constexpr int asio_transmit::batch_size;
-
-#if HAVE_SENDMMSG
-class sendmmsg_transmit
-{
-public:
-    static constexpr int batch_size = 8;
-
-private:
-    udp::socket socket;
-    int fd;
-    sockaddr_in addr;
-
-public:
-    sendmmsg_transmit(const options &opts, boost::asio::io_service &io_service)
-        : socket(io_service)
-    {
-        udp::resolver resolver(io_service);
-        udp::resolver::query query(udp::v4(), opts.host, opts.port);
-        udp::endpoint endpoint = *resolver.resolve(query);
-
-        addr.sin_family = AF_INET;
-        addr.sin_port = htons(endpoint.port());
-        addr.sin_addr.s_addr = htonl(endpoint.address().to_v4().to_ulong());
-
-        socket.open(udp::v4());
-        set_buffer_size(socket, opts.buffer_size);
-        fd = socket.native_handle();
-    }
-
-    template<typename Iterator>
-    void send_packets(Iterator first, Iterator last) const
-    {
-        mmsghdr msg_vec[batch_size];
-        iovec msg_iov[batch_size];
-
-        assert(last - first <= batch_size);
-        int next = 0;
-        std::memset(&msg_vec, 0, sizeof(msg_vec));
-        for (Iterator i = first; i != last; ++i)
-        {
-            msg_vec[next].msg_hdr.msg_name = (void *) &addr;
-            msg_vec[next].msg_hdr.msg_namelen = sizeof(addr);
-            msg_vec[next].msg_hdr.msg_iov = &msg_iov[next];
-            msg_vec[next].msg_hdr.msg_iovlen = 1;
-            msg_iov[next].iov_base = const_cast<u_char *>(i->data);
-            msg_iov[next].iov_len = i->len;
-            next++;
-        }
-        int status = sendmmsg(fd, &msg_vec[0], next, 0);
-        if (status != next)
-            throw std::system_error(errno, std::system_category(), "sendmmsg failed");
-        for (int i = 0; i < next; i++)
-            if (msg_vec[i].msg_len != msg_iov[i].iov_len)
-                throw std::runtime_error("short write");
-    }
-
-    void flush()
-    {
-    }
-};
-
-constexpr int sendmmsg_transmit::batch_size;
-#endif
-
-#if HAVE_IBV
-
-struct freeifaddrs_deleter
-{
-    void operator()(ifaddrs *ifa) const { freeifaddrs(ifa); }
-};
-
-struct mr_deleter
-{
-    void operator()(ibv_mr *mr) const { ibv_dereg_mr(mr); }
-};
-
-struct cq_deleter
-{
-    void operator()(ibv_cq *cq) const { ibv_destroy_cq(cq); }
-};
-
-struct qp_deleter
-{
-    void operator()(ibv_qp *qp) const { ibv_destroy_qp(qp); }
-};
-
-struct pd_deleter
-{
-    void operator()(ibv_pd *pd) const { ibv_dealloc_pd(pd); }
-};
-
-struct event_channel_deleter
-{
-    void operator()(rdma_event_channel *event_channel) const { rdma_destroy_event_channel(event_channel); }
-};
-
-struct cm_id_deleter
-{
-    void operator()(rdma_cm_id *cm_id) const { rdma_destroy_id(cm_id); }
-};
-
-template<typename T>
-class mmap_deleter
-{
-private:
-    std::size_t size;
-
-public:
-    mmap_deleter() = default;
-    mmap_deleter(std::size_t size) : size(size) {}
-
-    void operator()(T *ptr) const
-    {
-        munmap(ptr, size);
-    }
-};
-
-static std::unique_ptr<unsigned char[], mmap_deleter<unsigned char>>
-allocate_huge(std::size_t size)
-{
-    int flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB;
-    unsigned char *ptr = (unsigned char *) mmap(
-        nullptr, size, PROT_READ | PROT_WRITE, flags, -1, 0);
-    if (ptr == MAP_FAILED)
-    {
-        std::cerr << "Warning: hugetlb allocation failed, falling back to regular pages\n";
-        flags &= ~MAP_HUGETLB;
-        ptr = (unsigned char *) mmap(
-            nullptr, size, PROT_READ | PROT_WRITE, flags, -1, 0);
-        if (ptr == MAP_FAILED)
-            throw std::bad_alloc();
-    }
-    return {ptr, mmap_deleter<unsigned char>(size)};
-}
-
-// Finds the MAC address corresponding to an interface IP address
-static std::array<unsigned char, 6> get_mac(const boost::asio::ip::address &address)
-{
-    ifaddrs *ifap;
-    if (getifaddrs(&ifap) < 0)
-        throw std::system_error(errno, std::system_category(), "getifaddrs failed");
-    std::unique_ptr<ifaddrs, freeifaddrs_deleter> ifap_owner(ifap);
-
-    // Map address to an interface name
-    char *if_name = nullptr;
-    for (ifaddrs *cur = ifap; cur; cur = cur->ifa_next)
-    {
-        if (cur->ifa_addr && *(sa_family_t *) cur->ifa_addr == AF_INET && address.is_v4())
-        {
-            const sockaddr_in *cur_address = (const sockaddr_in *) cur->ifa_addr;
-            const auto expected = address.to_v4().to_bytes();
-            if (memcmp(&cur_address->sin_addr, &expected, sizeof(expected)) == 0)
-            {
-                if_name = cur->ifa_name;
-                break;
-            }
-        }
-        else if (cur->ifa_addr && *(sa_family_t *) cur->ifa_addr == AF_INET6 && address.is_v6())
-        {
-            const sockaddr_in6 *cur_address = (const sockaddr_in6 *) cur->ifa_addr;
-            const auto expected = address.to_v6().to_bytes();
-            if (memcmp(&cur_address->sin6_addr, &expected, sizeof(expected)) == 0)
-            {
-                if_name = cur->ifa_name;
-                break;
-            }
-        }
-    }
-    if (!if_name)
-    {
-        throw std::runtime_error("no interface found with the address " + address.to_string());
-    }
-
-    // Now find the MAC address for this interface
-    for (ifaddrs *cur = ifap; cur; cur = cur->ifa_next)
-    {
-        if (strcmp(cur->ifa_name, if_name) == 0
-            && cur->ifa_addr && *(sa_family_t *) cur->ifa_addr == AF_PACKET)
-        {
-            const sockaddr_ll *ll = (sockaddr_ll *) cur->ifa_addr;
-            if (ll->sll_hatype == ARPHRD_ETHER && ll->sll_halen == 6)
-            {
-                std::array<unsigned char, 6> mac;
-                std::memcpy(&mac, ll->sll_addr, 6);
-                return mac;
-            }
-        }
-    }
-    throw std::runtime_error(std::string("no MAC address found for interface ") + if_name);
-}
-
-static std::array<unsigned char, 6> multicast_mac(const boost::asio::ip::address_v4 &address)
-{
-    std::array<unsigned char, 6> ans;
-    auto bytes = address.to_bytes();
-    std::memcpy(&ans[2], &bytes, 4);
-    ans[0] = 0x01;
-    ans[1] = 0x00;
-    ans[2] = 0x5e;
-    ans[3] &= 0x7f;
-    return ans;
-}
-
-static std::array<unsigned char, 6> multicast_mac(const boost::asio::ip::address &address)
-{
-    return multicast_mac(address.to_v4());
-}
-
-static uint16_t ip_checksum(const unsigned char *header)
-{
-    uint32_t sum = 0;
-    for (int i = 0; i < 20; i += 2)
-    {
-        if (i == 10)
-            continue;   // skip the checksum itself
-        std::uint16_t word;
-        std::memcpy(&word, header + i, sizeof(word));
-        sum += ntohs(word);
-    }
-    while (sum > 0xffff)
-        sum = (sum & 0xffff) + (sum >> 16);
-    return ~htons(sum);
-}
-
-class ibv_transmit
-{
-public:
-    static constexpr int depth = 256;
-    static constexpr int batch_size = 16;
-
-private:
-    struct packet
-    {
-        ibv_sge sge{};
-        ibv_send_wr wr{};
-        unsigned char *data;
-        std::size_t capacity;
-
-        packet(packet &&other) noexcept(true)
-        {
-            *this = std::move(other);
-        }
-
-        packet &operator=(packet &&other) noexcept(true)
-        {
-            sge = std::move(other.sge);
-            wr = std::move(other.wr);
-            data = std::move(other.data);
-            capacity = std::move(other.capacity);
-            wr.sg_list = &sge;
-            wr.wr_id = std::uintptr_t(this);
-            return *this;
-        }
-
-        packet(ibv_mr *mr, unsigned char *data, std::size_t capacity,
-               const std::array<unsigned char, 6> &src_mac,
-               const std::array<unsigned char, 6> &dst_mac,
-               const udp::endpoint &src_endpoint,
-               const udp::endpoint &dst_endpoint)
-            : data(data), capacity(capacity)
-        {
-            sge.addr = (std::uintptr_t) data;
-            sge.lkey = mr->lkey;
-            wr.sg_list = &sge;
-            wr.num_sge = 1;
-            wr.opcode = IBV_WR_SEND;
-            wr.wr_id = std::uintptr_t(this);
-
-            memset(data, 0, 42); // Headers
-            // Ethernet header
-            unsigned char *ether = data;
-            std::memcpy(ether + 0, &dst_mac, sizeof(dst_mac));
-            std::memcpy(ether + 6, &src_mac, sizeof(src_mac));
-            ether[12] = 0x08; // ETHERTYPE_IP
-            ether[13] = 0x00;
-
-            // IP header
-            unsigned char *ip = ether + 14;
-            ip[0] = 0x45;  // Version 4, header length 20
-            ip[8] = 1;     // TTL
-            ip[9] = 0x11;  // Protocol: UDP
-            auto src_addr = src_endpoint.address().to_v4().to_bytes();
-            auto dst_addr = dst_endpoint.address().to_v4().to_bytes();
-            std::memcpy(ip + 12, &src_addr, sizeof(src_addr));
-            std::memcpy(ip + 16, &dst_addr, sizeof(dst_addr));
-
-            // UDP header
-            unsigned char *udp = ip + 20;
-            std::uint16_t src_port_be = htons(src_endpoint.port());
-            std::uint16_t dst_port_be = htons(dst_endpoint.port());
-            std::memcpy(udp + 0, &src_port_be, sizeof(src_port_be));
-            std::memcpy(udp + 2, &dst_port_be, sizeof(dst_port_be));
-        }
-
-        void set_length(std::size_t length)
-        {
-            if (length + 42 > capacity)
-                throw std::length_error("packet is too large");
-            // IP header
-            std::uint16_t length_ip = htons(length + 28);
-            std::memcpy(&data[16], &length_ip, sizeof(length_ip));
-            // UDP header
-            std::uint16_t length_udp = htons(length + 8);
-            std::memcpy(&data[38], &length_udp, sizeof(length_udp));
-            sge.length = length + 42; // TODO: unhardcode
-        }
-
-        void update_checksum()
-        {
-            unsigned char *ip = data + 14;
-            uint16_t checksum = ip_checksum(ip);
-            std::memcpy(&ip[10], &checksum, sizeof(checksum));
-        }
-
-        void *payload() const
-        {
-            return data + 42;
-        }
-    };
-
-    std::unique_ptr<rdma_event_channel, event_channel_deleter> event_channel;
-    std::unique_ptr<rdma_cm_id, cm_id_deleter> cm_id;
-    std::unique_ptr<ibv_pd, pd_deleter> pd;
-    std::unique_ptr<ibv_qp, qp_deleter> qp;
-    std::unique_ptr<ibv_cq, cq_deleter> cq;
-    std::vector<packet> packets;
-    std::stack<packet *> available;
-    std::unique_ptr<unsigned char[], mmap_deleter<unsigned char>> packet_storage;
-    std::unique_ptr<ibv_mr, mr_deleter> mr;
-    udp::socket socket; // only to allocate a port number
-
-    void modify_state(ibv_qp_state state, int port_num = -1)
-    {
-        int flags = IBV_QP_STATE;
-        ibv_qp_attr attr = {};
-        attr.qp_state = state;
-        if (port_num >= 0)
-        {
-            attr.port_num = port_num;
-            flags |= IBV_QP_PORT;
-        }
-        int status = ibv_modify_qp(qp.get(), &attr, flags);
-        if (status != 0)
-            throw std::system_error(status, std::system_category(), "ibv_modify_qp failed");
-    }
-
-    void wait_for_wc()
-    {
-        ibv_wc wc;
-        int status;
-        while ((status = ibv_poll_cq(cq.get(), 1, &wc)) == 0)
-        {
-            // Do nothing
-        }
-        if (status < 0)
-            throw std::runtime_error("ibv_poll_cq failed");
-        if (wc.status != IBV_WC_SUCCESS)
-        {
-            std::cerr << "WC failure: id=" << wc.wr_id
-                << " status=" << wc.status
-                << " vendor_err=" << wc.vendor_err
-                << '\n';
-            throw std::runtime_error("send failed");
-        }
-        available.push((packet *) (std::uintptr_t) wc.wr_id);
-    }
-
-public:
-    ibv_transmit(const options &opts, boost::asio::io_service &io_service)
-        : socket(io_service, udp::v4())
-    {
-        if (opts.bind == "")
-            throw std::runtime_error("--bind must be specified with --mode=ibv");
-        auto src_address = boost::asio::ip::address::from_string(opts.bind);
-        udp::endpoint src_endpoint(src_address, 0);
-        // Get the OS to assign us a source port
-        socket.bind(src_endpoint);
-        src_endpoint = socket.local_endpoint();
-        auto src_mac = get_mac(src_address);
-
-        udp::resolver resolver(io_service);
-        udp::resolver::query query(udp::v4(), opts.host, opts.port);
-        udp::endpoint endpoint = *resolver.resolve(query);
-        if (!endpoint.address().is_multicast())
-            throw std::runtime_error("Address must be multicast for --mode=ibv");
-
-        event_channel.reset(rdma_create_event_channel());
-        if (!event_channel)
-            throw std::system_error(errno, std::system_category(), "rdma_create_event_channel failed");
-        rdma_cm_id *cm_id_ptr;
-        if (rdma_create_id(event_channel.get(), &cm_id_ptr, NULL, RDMA_PS_UDP) < 0)
-            throw std::system_error(errno, std::system_category(), "rdma_create_id failed");
-        cm_id.reset(cm_id_ptr);
-        if (rdma_bind_addr(cm_id.get(), src_endpoint.data()) < 0)
-            throw std::system_error(errno, std::system_category(), "rdma_bind_addr failed");
-        if (!cm_id->verbs)
-            throw std::runtime_error("rdma_bind_addr did not bind to an RDMA device");
-
-        cq.reset(ibv_create_cq(cm_id->verbs, depth, NULL, NULL, 0));
-        if (!cq)
-            throw std::runtime_error("ibv_create_cq failed");
-        pd.reset(ibv_alloc_pd(cm_id->verbs));
-        if (!pd)
-            throw std::runtime_error("ibv_alloc_pd failed");
-
-        ibv_qp_init_attr qp_init_attr = {};
-        qp_init_attr.send_cq = cq.get();
-        qp_init_attr.recv_cq = cq.get();
-        qp_init_attr.qp_type = IBV_QPT_RAW_PACKET;
-        qp_init_attr.cap.max_send_wr = depth;
-        qp_init_attr.cap.max_recv_wr = 1;
-        qp_init_attr.cap.max_send_sge = 1;
-        qp_init_attr.cap.max_recv_sge = 1;
-        qp_init_attr.sq_sig_all = 1;
-        qp.reset(ibv_create_qp(pd.get(), &qp_init_attr));
-        if (!qp)
-            throw std::runtime_error("ibv_create_qp failed");
-
-        // Move to RTS state
-        modify_state(IBV_QPS_INIT, cm_id->port_num);
-        modify_state(IBV_QPS_RTR);
-        modify_state(IBV_QPS_RTS);
-
-        // Prepare packets
-        auto dst_mac = multicast_mac(endpoint.address());
-        packets.reserve(depth);
-        const std::size_t capacity = 65536;
-        packet_storage = allocate_huge(depth * capacity);
-        unsigned char *ptr = packet_storage.get();
-        mr.reset(ibv_reg_mr(pd.get(), ptr, depth * capacity,
-                            IBV_ACCESS_LOCAL_WRITE));
-        if (!mr)
-            throw std::runtime_error("ibv_reg_mr failed");
-        for (std::size_t i = 0; i < depth; i++)
-        {
-            packets.emplace_back(mr.get(), ptr, capacity, src_mac, dst_mac, src_endpoint, endpoint);
-            available.push(&packets.back());
-            ptr += capacity;
-        }
-    }
-
-    template<typename Iterator>
-    void send_packets(Iterator first, Iterator last)
-    {
-        if (first == last)
-            return;
-        std::size_t idx = 0;
-        ibv_send_wr *prev = nullptr;
-        ibv_send_wr *first_wr = nullptr;
-        for (Iterator cur = first; cur != last; ++cur, ++idx)
-        {
-            if (available.empty())
-                wait_for_wc();
-            packet *pkt = available.top();
-            available.pop();
-            std::memcpy(pkt->payload(), cur->data, cur->len);
-            pkt->set_length(cur->len);
-            pkt->update_checksum();
-            if (prev)
-                prev->next = &pkt->wr;
-            else
-                first_wr = &pkt->wr;
-            prev = &pkt->wr;
-        }
-        prev->next = nullptr;
-
-        ibv_send_wr *bad;
-        int status = ibv_post_send(qp.get(), first_wr, &bad);
-        if (status != 0)
-            throw std::system_error(status, std::system_category(), "ibv_post_send failed");
-    }
-
-    void flush()
-    {
-        while (available.size() < packets.size())
-            wait_for_wc();
-    }
-};
-
-constexpr int ibv_transmit::depth;
-constexpr int ibv_transmit::batch_size;
-#endif
-
-/// Wraps a transmitter to rate-limit it
-template<typename Transmit>
-class sender
-{
-private:
-    boost::asio::io_service &io_service;
-    Transmit transmit;
-    std::chrono::time_point<std::chrono::high_resolution_clock> start_time;
-    std::chrono::time_point<std::chrono::high_resolution_clock> next_send;
-    std::chrono::nanoseconds pps_interval{0};
-    double ns_per_byte = 0;
-    bool limited = false;
-
-public:
-    static constexpr int batch_size = Transmit::batch_size;
-
-    explicit sender(const options &opts, boost::asio::io_service &io_service)
-        : io_service(io_service), transmit(opts, io_service)
-    {
-        start_time = next_send = std::chrono::high_resolution_clock::now();
-        if (opts.pps != 0)
-        {
-            pps_interval = std::chrono::nanoseconds(uint64_t(1e9 / opts.pps));
-            limited = true;
-        }
-        if (opts.mbps != 0)
-        {
-            ns_per_byte = 8000.0 / opts.mbps;
-            limited = true;
-        }
-    }
-
-    template<typename Iterator>
-    void send_packets(Iterator first, Iterator last)
-    {
-        if (limited)
-        {
-            std::size_t send_bytes = 0;
-            for (Iterator i = first; i != last; ++i)
-                send_bytes += i->len;
-            asio::basic_waitable_timer<std::chrono::high_resolution_clock> timer(io_service);
-            timer.expires_at(next_send);
-            timer.wait();
-            transmit.send_packets(first, last);
-            next_send += pps_interval;
-            next_send += std::chrono::nanoseconds(uint64_t(ns_per_byte * send_bytes));
-        }
-        else
-        {
-            transmit.send_packets(first, last);
-        }
-    }
-
-    void flush()
-    {
-        transmit.flush();
-    }
-
-    std::chrono::high_resolution_clock::duration elapsed() const
-    {
-        return std::chrono::high_resolution_clock::now() - start_time;
-    }
-};
-
-class collector
-{
-private:
-    std::vector<u_char> storage;
-    std::vector<std::pair<std::size_t, std::size_t> > packet_offsets;
-
-public:
-    void add_packet(const packet &p)
-    {
-        std::size_t offset = storage.size();
-        storage.insert(storage.end(), p.data, p.data + p.len);
-        packet_offsets.emplace_back(offset, p.len);
-    }
-
-    template<typename Sender>
-    void replay(Sender &s, int repeat) const
-    {
-        std::array<packet, Sender::batch_size> batch;
-        for (int pass = 0; pass < repeat; pass++)
-        {
-            for (std::size_t i = 0; i < packet_offsets.size(); i += Sender::batch_size)
-            {
-                std::size_t end = std::min(i + Sender::batch_size, packet_offsets.size());
-                std::size_t len = end - i;
-                for (std::size_t j = i; j < end; j++)
-                {
-                    batch[j - i] = packet{storage.data() + packet_offsets[j].first, packet_offsets[j].second};
-                }
-                s.send_packets(batch.begin(), batch.begin() + len);
-            }
-        }
-        s.flush();
-    }
-
-    std::size_t get_bytes() const
-    {
-        return storage.size();
-    }
-};
-
+template<typename Collector>
 static void callback(u_char *user, const struct pcap_pkthdr *h, const u_char *bytes)
 {
     const unsigned int eth_hsize = 14;
@@ -725,9 +57,9 @@ static void callback(u_char *user, const struct pcap_pkthdr *h, const u_char *by
             bytes += udp_hsize;
             len -= udp_hsize;
 
-            collector *h = (collector *) user;
+            Collector *c = (Collector *) user;
             packet p = {bytes, len};
-            h->add_packet(p);
+            c->add_packet(p);
         }
     }
 }
@@ -751,18 +83,30 @@ template<typename Transmit>
 static void run(pcap_t *p, const options &opts)
 {
     boost::asio::io_service io_service;
-    typedef sender<Transmit> sender_t;
 
-    collector c;
-    pcap_loop(p, -1, callback, (u_char *) &c);
+    Transmit t(opts, io_service);
+    typedef typename Transmit::collector_type Collector;
+    Collector &collector = t.get_collector();
+    pcap_loop(p, -1, callback<Collector>, (u_char *) &collector);
+    std::size_t num_packets = collector.num_packets();
 
-    sender_t s(opts, io_service);
-    c.replay(s, opts.repeat);
-    std::chrono::duration<double> elapsed = s.elapsed();
-    std::int64_t bytes = c.get_bytes() * opts.repeat;
+    std::chrono::time_point<std::chrono::high_resolution_clock> start, stop;
+    start = std::chrono::high_resolution_clock::now();
+    for (int pass = 0; pass < opts.repeat; pass++)
+    {
+        for (std::size_t i = 0; i < num_packets; i += Transmit::batch_size)
+        {
+            std::size_t end = std::min(i + Transmit::batch_size, num_packets);
+            t.send_packets(i, end);
+        }
+    }
+    t.flush();
+    stop = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> elapsed = stop - start;
+    std::uint64_t bytes = collector.bytes() * opts.repeat;
 
     double time = elapsed.count();
-    std::cout << "Transmitted " << bytes << " in " << time << "s = "
+    std::cout << "Transmitted " << bytes << " bytes in " << time << "s = "
         << bytes * 8.0 / time / 1e9 << "Gbps\n";
 }
 
@@ -837,20 +181,20 @@ int main(int argc, char **argv)
 #if HAVE_SENDMMSG
         if (opts.mode == "sendmmsg")
         {
-            run<sendmmsg_transmit>(p.get(), opts);
+            run<rate_transmit<sendmmsg_transmit>>(p.get(), opts);
         }
         else
 #endif
 #if HAVE_IBV
         if (opts.mode == "ibv")
         {
-            run<ibv_transmit>(p.get(), opts);
+            run<rate_transmit<ibv_transmit>>(p.get(), opts);
         }
         else
 #endif
         if (opts.mode == "asio")
         {
-            run<asio_transmit>(p.get(), opts);
+            run<rate_transmit<asio_transmit>>(p.get(), opts);
         }
         else
         {
