@@ -350,8 +350,6 @@ void ibv_transmit::send_packets(std::size_t first, std::size_t last)
     ibv_send_wr *first_wr = nullptr;
     for (std::size_t i = first; i < last; ++i)
     {
-        if (slots == 0)
-            wait_for_wc();
         auto &f = collector->get_frame(i);
         if (prev)
             prev->next = &f.wr;
@@ -361,11 +359,14 @@ void ibv_transmit::send_packets(std::size_t first, std::size_t last)
     }
     prev->next = nullptr;
 
+    while (slots < last - first)
+        wait_for_wc();
+    slots -= last - first;
+
     ibv_send_wr *bad;
     int status = ibv_post_send(qp.get(), first_wr, &bad);
     if (status != 0)
         throw std::system_error(status, std::system_category(), "ibv_post_send failed");
-    slots -= last - first;
 }
 
 void ibv_transmit::flush()
