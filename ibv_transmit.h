@@ -151,7 +151,7 @@ private:
     std::unique_ptr<ibv_collector> collector;
 
     void modify_state(ibv_qp_state state, int port_num = -1);
-    void wait_for_wc();
+    void wait_for_wc(std::size_t min_slots);
 
 public:
     typedef ibv_collector collector_type;

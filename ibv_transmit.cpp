@@ -256,25 +256,31 @@ void ibv_transmit::modify_state(ibv_qp_state state, int port_num)
         throw std::system_error(status, std::system_category(), "ibv_modify_qp failed");
 }
 
-void ibv_transmit::wait_for_wc()
+void ibv_transmit::wait_for_wc(std::size_t min_slots)
 {
-    ibv_wc wc;
-    int status;
-    while ((status = ibv_poll_cq(cq.get(), 1, &wc)) == 0)
+    ibv_wc wc[batch_size];
+    while (slots < min_slots)
     {
-        // Do nothing
+        int status;
+        while ((status = ibv_poll_cq(cq.get(), batch_size, wc)) == 0)
+        {
+            // Do nothing
+        }
+        if (status < 0)
+            throw std::runtime_error("ibv_poll_cq failed");
+        for (int i = 0; i < status; i++)
+        {
+            if (wc[i].status != IBV_WC_SUCCESS)
+            {
+                std::cerr << "WC failure: id=" << wc[i].wr_id
+                    << " status=" << wc[i].status
+                    << " vendor_err=" << wc[i].vendor_err
+                    << '\n';
+                throw std::runtime_error("send failed");
+            }
+        }
+        slots += status;
     }
-    if (status < 0)
-        throw std::runtime_error("ibv_poll_cq failed");
-    if (wc.status != IBV_WC_SUCCESS)
-    {
-        std::cerr << "WC failure: id=" << wc.wr_id
-            << " status=" << wc.status
-            << " vendor_err=" << wc.vendor_err
-            << '\n';
-        throw std::runtime_error("send failed");
-    }
-    slots++;
 }
 
 ibv_transmit::ibv_transmit(const options &opts, boost::asio::io_service &io_service)
@@ -359,8 +365,7 @@ void ibv_transmit::send_packets(std::size_t first, std::size_t last)
     }
     prev->next = nullptr;
 
-    while (slots < last - first)
-        wait_for_wc();
+    wait_for_wc(last - first);
     slots -= last - first;
 
     ibv_send_wr *bad;
@@ -371,8 +376,7 @@ void ibv_transmit::send_packets(std::size_t first, std::size_t last)
 
 void ibv_transmit::flush()
 {
-    while (slots < depth)
-        wait_for_wc();
+    wait_for_wc(depth);
 }
 
 constexpr int ibv_transmit::depth;
