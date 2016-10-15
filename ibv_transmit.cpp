@@ -212,6 +212,7 @@ void ibv_collector::add_packet(const packet &pkt)
     frame &f = frames.back();
     f.sge.addr = (std::uintptr_t) data;
     f.sge.lkey = slabs.back().mr->lkey;
+    f.sge.length = raw_size;
     f.wr.sg_list = &f.sge;
     f.wr.num_sge = 1;
     f.wr.opcode = IBV_WR_SEND;
