@@ -346,10 +346,9 @@ void ibv_transmit::send_packets(std::size_t first, std::size_t last)
         // packet twice, which would do bad things.
         flush();
     }
-    std::size_t idx = 0;
     ibv_send_wr *prev = nullptr;
     ibv_send_wr *first_wr = nullptr;
-    for (std::size_t i = first; i < last; ++i, ++idx)
+    for (std::size_t i = first; i < last; ++i)
     {
         if (slots == 0)
             wait_for_wc();
