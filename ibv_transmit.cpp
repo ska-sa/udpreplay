@@ -142,7 +142,7 @@ allocate_huge(std::size_t size)
 
 ibv_collector::slab::slab(ibv_pd *pd, std::size_t capacity)
     : data(allocate_huge(capacity)),
-    mr(ibv_reg_mr(pd, data.get(), capacity, IBV_ACCESS_LOCAL_WRITE)),
+    mr(ibv_reg_mr(pd, data.get(), capacity, 0)),
     capacity(capacity),
     used(0)
 {
@@ -216,7 +216,6 @@ void ibv_collector::add_packet(const packet &pkt)
     f.wr.sg_list = &f.sge;
     f.wr.num_sge = 1;
     f.wr.opcode = IBV_WR_SEND;
-    f.wr.wr_id = std::uintptr_t(&f);
     f.packet_size = pkt.len;
     total_bytes += pkt.len;
 }
@@ -278,8 +277,8 @@ void ibv_transmit::wait_for_wc(std::size_t min_slots)
                     << '\n';
                 throw std::runtime_error("send failed");
             }
+            slots += wc[i].wr_id;
         }
-        slots += status;
     }
 }
 
@@ -327,7 +326,7 @@ ibv_transmit::ibv_transmit(const options &opts, boost::asio::io_service &io_serv
     qp_init_attr.cap.max_recv_wr = 1;
     qp_init_attr.cap.max_send_sge = 1;
     qp_init_attr.cap.max_recv_sge = 1;
-    qp_init_attr.sq_sig_all = 1;
+    qp_init_attr.sq_sig_all = 0;
     qp.reset(ibv_create_qp(pd.get(), &qp_init_attr));
     if (!qp)
         throw std::runtime_error("ibv_create_qp failed");
@@ -362,6 +361,18 @@ void ibv_transmit::send_packets(std::size_t first, std::size_t last)
         else
             first_wr = &f.wr;
         prev = &f.wr;
+        // We get a CQE only for the last WR in the batch, and we use the wr_id
+        // to store the batch size.
+        if (i == last - 1)
+        {
+            f.wr.wr_id = last - first;
+            f.wr.send_flags = IBV_SEND_SIGNALED;
+        }
+        else
+        {
+            f.wr.wr_id = 0;
+            f.wr.send_flags = 0;
+        }
     }
     prev->next = nullptr;
 
