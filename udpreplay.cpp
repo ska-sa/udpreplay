@@ -52,6 +52,7 @@ using boost::asio::ip::udp;
 
 struct options
 {
+    bool ot = false;
     double pps = 0;
     double mbps = 0;
     size_t buffer_size = 0;
@@ -67,6 +68,7 @@ struct packet
 {
     const u_char *data;
     std::size_t len;
+    std::chrono::nanoseconds delay;
 };
 
 static void set_buffer_size(udp::socket &socket, std::size_t size)
@@ -611,6 +613,7 @@ private:
     std::chrono::nanoseconds pps_interval{0};
     double ns_per_byte = 0;
     bool limited = false;
+    bool orig_timing = false;
 
 public:
     static constexpr int batch_size = Transmit::batch_size;
@@ -624,6 +627,10 @@ public:
             pps_interval = std::chrono::nanoseconds(uint64_t(1e9 / opts.pps));
             limited = true;
         }
+        if (opts.ot)
+        {
+            orig_timing = true;
+        }
         if (opts.mbps != 0)
         {
             ns_per_byte = 8000.0 / opts.mbps;
@@ -634,7 +641,15 @@ public:
     template<typename Iterator>
     void send_packets(Iterator first, Iterator last)
     {
-        if (limited)
+        if (orig_timing)
+        {
+            next_send += first->delay;
+            asio::basic_waitable_timer<std::chrono::high_resolution_clock> timer(io_service);
+            timer.expires_at(next_send);
+            timer.wait();
+            transmit.send_packets(first, last);
+        }
+        else if (limited)
         {
             std::size_t send_bytes = 0;
             for (Iterator i = first; i != last; ++i)
@@ -668,6 +683,7 @@ class collector
 private:
     std::vector<u_char> storage;
     std::vector<std::pair<std::size_t, std::size_t> > packet_offsets;
+    std::vector<std::chrono::nanoseconds> packet_delay;
 
 public:
     void add_packet(const packet &p)
@@ -675,6 +691,7 @@ public:
         std::size_t offset = storage.size();
         storage.insert(storage.end(), p.data, p.data + p.len);
         packet_offsets.emplace_back(offset, p.len);
+        packet_delay.insert(packet_delay.end(), p.delay);
     }
 
     template<typename Sender>
@@ -689,7 +706,7 @@ public:
                 std::size_t len = end - i;
                 for (std::size_t j = i; j < end; j++)
                 {
-                    batch[j - i] = packet{storage.data() + packet_offsets[j].first, packet_offsets[j].second};
+                    batch[j - i] = packet{storage.data() + packet_offsets[j].first, packet_offsets[j].second, packet_delay[j]};
                 }
                 s.send_packets(batch.begin(), batch.begin() + len);
             }
@@ -707,11 +724,17 @@ static void callback(u_char *user, const struct pcap_pkthdr *h, const u_char *by
 {
     const unsigned int eth_hsize = 14;
     bpf_u_int32 len = h->caplen;
+    std::chrono::nanoseconds delta_time;
+    static time_t previous_sec = h->ts.tv_sec;
+    static suseconds_t previous_usec = h->ts.tv_usec;
     if (h->len != len)
     {
         std::cerr << "Skipping truncated packet\n";
         return;
     }
+
+    delta_time = std::chrono::nanoseconds(uint64_t(1e9 * (h->ts.tv_sec - previous_sec) + 1e3 * (h->ts.tv_usec - previous_usec)));
+
     if (len > eth_hsize)
     {
         bytes += eth_hsize;
@@ -726,10 +749,13 @@ static void callback(u_char *user, const struct pcap_pkthdr *h, const u_char *by
             len -= udp_hsize;
 
             collector *h = (collector *) user;
-            packet p = {bytes, len};
+            packet p = {bytes, len, delta_time};
             h->add_packet(p);
         }
     }
+
+    previous_sec = h->ts.tv_sec;
+    previous_usec = h->ts.tv_usec;
 }
 
 static void prepare(pcap_t *p)
@@ -776,6 +802,7 @@ static options parse_args(int argc, char **argv)
 
     po::options_description desc;
     desc.add_options()
+        ("ot", "original timing (delta between packets)")
         ("pps", po::value<double>(&out.pps), "packets per second (0 for max speed)")
         ("mbps", po::value<double>(&out.mbps), "bits per second (0 for max speed)")
         ("host", po::value<std::string>(&out.host)->default_value(defaults.host), "destination host")
@@ -803,6 +830,12 @@ static options parse_args(int argc, char **argv)
                   .positional(positional)
                   .run(), vm);
         po::notify(vm);
+        if (vm.count("ot"))
+        {
+            out.ot = true;
+            if (vm.count("pps") || vm.count("mbps"))
+                throw po::error("Cannot specify both --ot and (--pps or --mbps)");
+        }
         if (vm.count("pps") && vm.count("mbps"))
             throw po::error("Cannot specify both --pps and --mbps");
         return out;

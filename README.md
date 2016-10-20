@@ -7,7 +7,7 @@ and not the headers, so it does not require root privileges and works fine with
 the Linux loopback device.
 
 It supports rate control, either in packets per second or bits per second.
-It does not support replay with the original timings.
+It does support replay with the original timings.
 
 The packets are pre-loaded from the pcap file, so it is possible to send at a
 higher rate than the packets can be loaded. Typically, the NIC or the kernel
