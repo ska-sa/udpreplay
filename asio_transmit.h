@@ -19,7 +19,6 @@
 
 #include <config.h>
 #include <boost/asio.hpp>
-#include <chrono>
 #include "common.h"
 
 class asio_transmit

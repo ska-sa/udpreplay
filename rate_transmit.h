@@ -2,7 +2,6 @@
 #define UDPREPLAY_RATE_TRANSMIT_H
 
 #include <config.h>
-#include <chrono>
 #include <boost/asio.hpp>
 #include "common.h"
 

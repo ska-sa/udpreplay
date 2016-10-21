@@ -22,7 +22,6 @@
 #if HAVE_SENDMMSG
 
 #include <netinet/in.h>
-#include <chrono>
 #include <boost/asio.hpp>
 #include "common.h"
 

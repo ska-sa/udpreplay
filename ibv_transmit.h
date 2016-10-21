@@ -27,7 +27,6 @@
 #include <array>
 #include <cstdint>
 #include <cstring>
-#include <chrono>
 #include <boost/noncopyable.hpp>
 #include <boost/asio.hpp>
 #include <rdma/rdma_cma.h>
