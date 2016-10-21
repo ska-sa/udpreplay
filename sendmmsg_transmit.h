@@ -42,7 +42,7 @@ public:
     sendmmsg_transmit(const options &opts, boost::asio::io_service &io_service);
 
     collector_type &get_collector() { return collector; }
-    void send_packets(std::size_t first, std::size_t last);
+    void send_packets(std::size_t first, std::size_t last, time_point start);
     void flush() {}
 };
 

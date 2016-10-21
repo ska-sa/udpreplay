@@ -217,6 +217,7 @@ void ibv_collector::add_packet(const packet &pkt)
     f.wr.num_sge = 1;
     f.wr.opcode = IBV_WR_SEND;
     f.packet_size = pkt.len;
+    f.timestamp = pkt.timestamp;
     total_bytes += pkt.len;
 }
 
@@ -233,6 +234,11 @@ ibv_collector::frame &ibv_collector::get_frame(std::size_t idx)
 std::size_t ibv_collector::packet_size(std::size_t idx) const
 {
     return frames[idx].packet_size;
+}
+
+duration ibv_collector::packet_timestamp(std::size_t idx) const
+{
+    return frames[idx].timestamp;
 }
 
 std::size_t ibv_collector::bytes() const
@@ -341,8 +347,10 @@ ibv_transmit::ibv_transmit(const options &opts, boost::asio::io_service &io_serv
             get_mac(src_endpoint.address()), multicast_mac(endpoint.address())));
 }
 
-void ibv_transmit::send_packets(std::size_t first, std::size_t last)
+void ibv_transmit::send_packets(std::size_t first, std::size_t last,
+                                time_point start)
 {
+    (void) start; // unused;
     if (first == last)
         return;
     if (first == 0 && collector->num_packets() < depth)

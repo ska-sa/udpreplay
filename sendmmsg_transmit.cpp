@@ -45,8 +45,10 @@ sendmmsg_transmit::sendmmsg_transmit(const options &opts, boost::asio::io_servic
     fd = socket.native_handle();
 }
 
-void sendmmsg_transmit::send_packets(std::size_t first, std::size_t last)
+void sendmmsg_transmit::send_packets(std::size_t first, std::size_t last,
+                                     time_point start)
 {
+    (void) start; // unused;
     mmsghdr msg_vec[batch_size];
     iovec msg_iov[batch_size];
 

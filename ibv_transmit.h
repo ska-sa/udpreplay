@@ -107,6 +107,7 @@ private:
         ibv_sge sge{};
         ibv_send_wr wr{};
         std::size_t packet_size;
+        duration timestamp;
     };
 
     ibv_pd *pd;
@@ -130,6 +131,7 @@ public:
     void add_packet(const packet &pkt);
     std::size_t num_packets() const;
     std::size_t packet_size(std::size_t idx) const;
+    duration packet_timestamp(std::size_t idx) const;
     std::size_t bytes() const;
     frame &get_frame(std::size_t idx);
 };
@@ -159,7 +161,7 @@ public:
     ibv_transmit(const options &opts, boost::asio::io_service &io_service);
 
     collector_type &get_collector() { return *collector; }
-    void send_packets(std::size_t first, std::size_t last);
+    void send_packets(std::size_t first, std::size_t last, time_point start);
     void flush();
 };
 
