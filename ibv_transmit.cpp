@@ -142,7 +142,7 @@ allocate_huge(std::size_t size)
 
 ibv_collector::slab::slab(ibv_pd *pd, std::size_t capacity)
     : data(allocate_huge(capacity)),
-    mr(ibv_reg_mr(pd, data.get(), capacity, IBV_ACCESS_LOCAL_WRITE)),
+    mr(ibv_reg_mr(pd, data.get(), capacity, 0)),
     capacity(capacity),
     used(0)
 {
@@ -212,10 +212,10 @@ void ibv_collector::add_packet(const packet &pkt)
     frame &f = frames.back();
     f.sge.addr = (std::uintptr_t) data;
     f.sge.lkey = slabs.back().mr->lkey;
+    f.sge.length = raw_size;
     f.wr.sg_list = &f.sge;
     f.wr.num_sge = 1;
     f.wr.opcode = IBV_WR_SEND;
-    f.wr.wr_id = std::uintptr_t(&f);
     f.packet_size = pkt.len;
     f.timestamp = pkt.timestamp;
     total_bytes += pkt.len;
@@ -261,25 +261,31 @@ void ibv_transmit::modify_state(ibv_qp_state state, int port_num)
         throw std::system_error(status, std::system_category(), "ibv_modify_qp failed");
 }
 
-void ibv_transmit::wait_for_wc()
+void ibv_transmit::wait_for_wc(std::size_t min_slots)
 {
-    ibv_wc wc;
-    int status;
-    while ((status = ibv_poll_cq(cq.get(), 1, &wc)) == 0)
+    ibv_wc wc[batch_size];
+    while (slots < min_slots)
     {
-        // Do nothing
+        int status;
+        while ((status = ibv_poll_cq(cq.get(), batch_size, wc)) == 0)
+        {
+            // Do nothing
+        }
+        if (status < 0)
+            throw std::runtime_error("ibv_poll_cq failed");
+        for (int i = 0; i < status; i++)
+        {
+            if (wc[i].status != IBV_WC_SUCCESS)
+            {
+                std::cerr << "WC failure: id=" << wc[i].wr_id
+                    << " status=" << wc[i].status
+                    << " vendor_err=" << wc[i].vendor_err
+                    << '\n';
+                throw std::runtime_error("send failed");
+            }
+            slots += wc[i].wr_id;
+        }
     }
-    if (status < 0)
-        throw std::runtime_error("ibv_poll_cq failed");
-    if (wc.status != IBV_WC_SUCCESS)
-    {
-        std::cerr << "WC failure: id=" << wc.wr_id
-            << " status=" << wc.status
-            << " vendor_err=" << wc.vendor_err
-            << '\n';
-        throw std::runtime_error("send failed");
-    }
-    slots++;
 }
 
 ibv_transmit::ibv_transmit(const options &opts, boost::asio::io_service &io_service)
@@ -326,7 +332,7 @@ ibv_transmit::ibv_transmit(const options &opts, boost::asio::io_service &io_serv
     qp_init_attr.cap.max_recv_wr = 1;
     qp_init_attr.cap.max_send_sge = 1;
     qp_init_attr.cap.max_recv_sge = 1;
-    qp_init_attr.sq_sig_all = 1;
+    qp_init_attr.sq_sig_all = 0;
     qp.reset(ibv_create_qp(pd.get(), &qp_init_attr));
     if (!qp)
         throw std::runtime_error("ibv_create_qp failed");
@@ -347,33 +353,49 @@ void ibv_transmit::send_packets(std::size_t first, std::size_t last,
     (void) start; // unused;
     if (first == last)
         return;
-    std::size_t idx = 0;
+    if (first == 0 && collector->num_packets() < depth)
+    {
+        // If we wrap the send queue around it could try to send the same
+        // packet twice, which would do bad things.
+        flush();
+    }
     ibv_send_wr *prev = nullptr;
     ibv_send_wr *first_wr = nullptr;
-    for (std::size_t i = first; i < last; ++i, ++idx)
+    for (std::size_t i = first; i < last; ++i)
     {
-        if (slots == 0)
-            wait_for_wc();
         auto &f = collector->get_frame(i);
         if (prev)
             prev->next = &f.wr;
         else
             first_wr = &f.wr;
         prev = &f.wr;
+        // We get a CQE only for the last WR in the batch, and we use the wr_id
+        // to store the batch size.
+        if (i == last - 1)
+        {
+            f.wr.wr_id = last - first;
+            f.wr.send_flags = IBV_SEND_SIGNALED;
+        }
+        else
+        {
+            f.wr.wr_id = 0;
+            f.wr.send_flags = 0;
+        }
     }
     prev->next = nullptr;
+
+    wait_for_wc(last - first);
+    slots -= last - first;
 
     ibv_send_wr *bad;
     int status = ibv_post_send(qp.get(), first_wr, &bad);
     if (status != 0)
         throw std::system_error(status, std::system_category(), "ibv_post_send failed");
-    slots -= last - first;
 }
 
 void ibv_transmit::flush()
 {
-    while (slots < depth)
-        wait_for_wc();
+    wait_for_wc(depth);
 }
 
 constexpr int ibv_transmit::depth;
