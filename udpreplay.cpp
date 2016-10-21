@@ -21,6 +21,7 @@
 #include <vector>
 #include <chrono>
 #include <stdexcept>
+#include <functional>
 #include <system_error>
 #include <pcap.h>
 #include <boost/program_options.hpp>
@@ -33,6 +34,17 @@
 namespace asio = boost::asio;
 namespace po = boost::program_options;
 using boost::asio::ip::udp;
+
+struct callback_data
+{
+    std::function<void(const packet &packet)> add_packet;
+    std::chrono::duration<double, duration::period> per_packet{0.0};
+    std::chrono::duration<double, duration::period> per_byte{0.0};
+    bool use_timestamps;
+    struct timeval start;
+    std::uint64_t packets = 0;
+    std::uint64_t bytes = 0;
+};
 
 template<typename Collector>
 static void callback(u_char *user, const struct pcap_pkthdr *h, const u_char *bytes)
@@ -57,9 +69,25 @@ static void callback(u_char *user, const struct pcap_pkthdr *h, const u_char *by
             bytes += udp_hsize;
             len -= udp_hsize;
 
-            Collector *c = (Collector *) user;
-            packet p = {bytes, len};
-            c->add_packet(p);
+            callback_data *data = (callback_data *) user;
+            duration timestamp;
+            if (data->use_timestamps)
+            {
+                if (data->packets == 0)
+                    data->start = h->ts;
+                auto ts = std::chrono::seconds(h->ts.tv_sec - data->start.tv_sec)
+                    + std::chrono::nanoseconds(h->ts.tv_usec - data->start.tv_usec);
+                timestamp = std::chrono::duration_cast<duration>(ts);
+            }
+            else
+            {
+                timestamp = std::chrono::duration_cast<duration>(
+                    data->per_byte * data->bytes + data->per_packet * data->packets);
+            }
+            packet p = {bytes, len, timestamp};
+            data->add_packet(p);
+            data->packets++;
+            data->bytes += len;
         }
     }
 }
@@ -86,18 +114,34 @@ static void run(pcap_t *p, const options &opts)
 
     Transmit t(opts, io_service);
     typedef typename Transmit::collector_type Collector;
+    callback_data data;
     Collector &collector = t.get_collector();
-    pcap_loop(p, -1, callback<Collector>, (u_char *) &collector);
+    data.add_packet = [&collector](const packet &pkt) { collector.add_packet(pkt); };
+    if (opts.mbps != 0)
+        data.per_byte = std::chrono::duration<double, std::micro>(8.0 / opts.mbps);
+    if (opts.pps != 0)
+        data.per_packet = std::chrono::duration<double>(1.0 / opts.pps);
+    data.use_timestamps = opts.use_timestamps;
+    pcap_loop(p, -1, callback<Collector>, (u_char *) &data);
     std::size_t num_packets = collector.num_packets();
 
-    std::chrono::time_point<std::chrono::high_resolution_clock> start, stop;
+    /* Time offset between the equivalent packets in each repetition. */
+    std::chrono::duration<double, duration::period> rep_step;
+    if (opts.use_timestamps)
+        rep_step = collector.packet_timestamp(collector.num_packets() - 1);
+    else
+        rep_step = data.per_byte * data.bytes + data.per_packet * data.packets;
+
+    time_point start, rep_start, stop;
     start = std::chrono::high_resolution_clock::now();
+    const std::size_t batch_size = opts.use_timestamps ? 1 : Transmit::batch_size;
     for (int pass = 0; pass < opts.repeat; pass++)
     {
-        for (std::size_t i = 0; i < num_packets; i += Transmit::batch_size)
+        rep_start = start + std::chrono::duration_cast<duration>(pass * rep_step);
+        for (std::size_t i = 0; i < num_packets; i += batch_size)
         {
-            std::size_t end = std::min(i + Transmit::batch_size, num_packets);
-            t.send_packets(i, end);
+            std::size_t end = std::min(i + batch_size, num_packets);
+            t.send_packets(i, end, rep_start);
         }
     }
     t.flush();
@@ -122,6 +166,7 @@ static options parse_args(int argc, char **argv)
     desc.add_options()
         ("pps", po::value<double>(&out.pps), "packets per second (0 for max speed)")
         ("mbps", po::value<double>(&out.mbps), "bits per second (0 for max speed)")
+        ("use-timestamps", po::bool_switch(&out.use_timestamps)->default_value(defaults.use_timestamps), "use timestamps from the file for replay timing")
         ("host", po::value<std::string>(&out.host)->default_value(defaults.host), "destination host")
         ("port", po::value<std::string>(&out.port)->default_value(defaults.port), "destination port")
         ("bind", po::value<std::string>(&out.bind)->default_value(defaults.bind), "local address (for multicast)")
@@ -147,8 +192,8 @@ static options parse_args(int argc, char **argv)
                   .positional(positional)
                   .run(), vm);
         po::notify(vm);
-        if (vm.count("pps") && vm.count("mbps"))
-            throw po::error("Cannot specify both --pps and --mbps");
+        if (vm.count("pps") + vm.count("mbps") + out.use_timestamps > 1)
+            throw po::error("Cannot specify more than one of --pps, --mbps and --use-timestamps");
         return out;
     }
     catch (po::error &e)
@@ -163,7 +208,8 @@ static options parse_args(int argc, char **argv)
 std::shared_ptr<pcap_t> open_capture(const options &opts)
 {
     char errbuf[PCAP_ERRBUF_SIZE];
-    pcap_t *p = pcap_open_offline(opts.input_file.c_str(), errbuf);
+    pcap_t *p = pcap_open_offline_with_tstamp_precision(
+        opts.input_file.c_str(), PCAP_TSTAMP_PRECISION_NANO, errbuf);
     if (p == NULL)
     {
         throw std::runtime_error(errbuf);

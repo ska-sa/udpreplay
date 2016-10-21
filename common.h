@@ -23,13 +23,18 @@
 #include <cstdint>
 #include <cstddef>
 #include <string>
+#include <chrono>
 #include <boost/asio.hpp>
 #include "common.h"
+
+typedef std::chrono::time_point<std::chrono::high_resolution_clock> time_point;
+typedef time_point::duration duration;
 
 struct options
 {
     double pps = 0;
     double mbps = 0;
+    bool use_timestamps = false;
     std::size_t buffer_size = 0;
     std::size_t repeat = 1;
     std::string mode = "asio";
@@ -43,20 +48,29 @@ struct packet
 {
     const std::uint8_t *data;
     std::size_t len;
+    duration timestamp;  // relative to start of capture
 };
 
 class basic_collector
 {
 private:
+    struct packet_info
+    {
+        std::size_t offset;
+        std::size_t len;
+        duration timestamp;
+    };
+
     std::vector<std::uint8_t> storage;
-    std::vector<std::pair<std::size_t, std::size_t> > packet_offsets;
+    std::vector<packet_info> packets;
 
 public:
     void add_packet(const packet &pkt);
     std::size_t num_packets() const;
     packet get_packet(std::size_t idx) const;
     std::size_t packet_size(std::size_t idx) const;
-    std::size_t bytes() const;
+    duration packet_timestamp(std::size_t idx) const;
+    std::size_t bytes() const;   // total payload bytes collected
 };
 
 void set_buffer_size(boost::asio::ip::udp::socket &socket, std::size_t size);

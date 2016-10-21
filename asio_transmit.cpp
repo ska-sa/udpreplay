@@ -31,8 +31,10 @@ asio_transmit::asio_transmit(const options &opts, boost::asio::io_service &io_se
     set_buffer_size(socket, opts.buffer_size);
 }
 
-void asio_transmit::send_packets(std::size_t first, std::size_t last)
+void asio_transmit::send_packets(std::size_t first, std::size_t last,
+                                 time_point start)
 {
+    (void) start; // unused
     for (std::size_t i = first; i < last; i++)
     {
         packet pkt = collector.get_packet(i);

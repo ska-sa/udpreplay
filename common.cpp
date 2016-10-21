@@ -24,22 +24,27 @@ void basic_collector::add_packet(const packet &pkt)
 {
     std::size_t offset = storage.size();
     storage.insert(storage.end(), pkt.data, pkt.data + pkt.len);
-    packet_offsets.emplace_back(offset, pkt.len);
+    packets.push_back(packet_info{offset, pkt.len, pkt.timestamp});
 }
 
 std::size_t basic_collector::num_packets() const
 {
-    return packet_offsets.size();
+    return packets.size();
 }
 
 packet basic_collector::get_packet(std::size_t idx) const
 {
-    return {storage.data() + packet_offsets[idx].first, packet_offsets[idx].second};
+    return {storage.data() + packets[idx].offset, packets[idx].len, packets[idx].timestamp};
 }
 
 std::size_t basic_collector::packet_size(std::size_t idx) const
 {
-    return packet_offsets[idx].second;
+    return packets[idx].len;
+}
+
+duration basic_collector::packet_timestamp(std::size_t idx) const
+{
+    return packets[idx].timestamp;
 }
 
 std::size_t basic_collector::bytes() const
