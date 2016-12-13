@@ -16,6 +16,7 @@
 
 #include <cstring>
 #include <cstddef>
+#include <iostream>
 #include "common.h"
 
 using boost::asio::ip::udp;
