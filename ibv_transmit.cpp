@@ -35,6 +35,8 @@ using boost::asio::ip::udp;
 
 static mac_address multicast_mac(const boost::asio::ip::address_v4 &address)
 {
+    if (!address.is_multicast())
+        throw std::runtime_error("Address must be multicast for --mode=ibv");
     mac_address ans;
     auto bytes = address.to_bytes();
     std::memcpy(&ans[2], &bytes, 4);
@@ -43,11 +45,6 @@ static mac_address multicast_mac(const boost::asio::ip::address_v4 &address)
     ans[2] = 0x5e;
     ans[3] &= 0x7f;
     return ans;
-}
-
-static mac_address multicast_mac(const boost::asio::ip::address &address)
-{
-    return multicast_mac(address.to_v4());
 }
 
 // Finds the MAC address corresponding to an interface IP address
@@ -151,12 +148,9 @@ ibv_collector::slab::slab(ibv_pd *pd, std::size_t capacity)
 ibv_collector::ibv_collector(
     ibv_pd *pd,
     const boost::asio::ip::udp::endpoint &src_endpoint,
-    const boost::asio::ip::udp::endpoint &dst_endpoint,
     const mac_address &src_mac,
-    const mac_address &dst_mac,
     std::size_t slab_size)
-    : pd(pd), src_endpoint(src_endpoint), dst_endpoint(dst_endpoint),
-    src_mac(src_mac), dst_mac(dst_mac),
+    : pd(pd), src_endpoint(src_endpoint), src_mac(src_mac),
     slab_size(slab_size)
 {
 }
@@ -174,6 +168,10 @@ void ibv_collector::add_packet(const packet &pkt)
     std::uint8_t *data = slabs.back().data.get() + slabs.back().used;
     slabs.back().used += raw_size;
 
+    boost::asio::ip::address_v4::bytes_type dst_addr;
+    std::memcpy(&dst_addr, &pkt.dst_host, sizeof(dst_addr));
+    mac_address dst_mac = multicast_mac(boost::asio::ip::address_v4(dst_addr));
+
     memset(data, 0, 42); // Headers
     // Ethernet header
     std::uint8_t *ether = data;
@@ -188,7 +186,6 @@ void ibv_collector::add_packet(const packet &pkt)
     ip[8] = 1;     // TTL
     ip[9] = 0x11;  // Protocol: UDP
     auto src_addr = src_endpoint.address().to_v4().to_bytes();
-    auto dst_addr = dst_endpoint.address().to_v4().to_bytes();
     std::uint16_t length_ip = htons(pkt.len + 28);
     std::memcpy(ip + 2, &length_ip, sizeof(length_ip));
     std::memcpy(ip + 12, &src_addr, sizeof(src_addr));
@@ -199,7 +196,7 @@ void ibv_collector::add_packet(const packet &pkt)
     // UDP header
     std::uint8_t *udp = ip + 20;
     std::uint16_t src_port_be = htons(src_endpoint.port());
-    std::uint16_t dst_port_be = htons(dst_endpoint.port());
+    std::uint16_t dst_port_be = pkt.dst_port;
     std::uint16_t length_udp = htons(pkt.len + 8);
     std::memcpy(udp + 0, &src_port_be, sizeof(src_port_be));
     std::memcpy(udp + 2, &dst_port_be, sizeof(dst_port_be));
@@ -299,12 +296,6 @@ ibv_transmit::ibv_transmit(const options &opts, boost::asio::io_service &io_serv
     socket.bind(src_endpoint);
     src_endpoint = socket.local_endpoint();
 
-    udp::resolver resolver(io_service);
-    udp::resolver::query query(udp::v4(), opts.host, opts.port);
-    udp::endpoint endpoint = *resolver.resolve(query);
-    if (!endpoint.address().is_multicast())
-        throw std::runtime_error("Address must be multicast for --mode=ibv");
-
     event_channel.reset(rdma_create_event_channel());
     if (!event_channel)
         throw std::system_error(errno, std::system_category(), "rdma_create_event_channel failed");
@@ -343,8 +334,8 @@ ibv_transmit::ibv_transmit(const options &opts, boost::asio::io_service &io_serv
     modify_state(IBV_QPS_RTS);
 
     collector.reset(new ibv_collector(
-            pd.get(), src_endpoint, endpoint,
-            get_mac(src_endpoint.address()), multicast_mac(endpoint.address())));
+            pd.get(), src_endpoint,
+            get_mac(src_endpoint.address())));
 }
 
 void ibv_transmit::send_packets(std::size_t first, std::size_t last,

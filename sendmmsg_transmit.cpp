@@ -32,14 +32,6 @@ using boost::asio::ip::udp;
 sendmmsg_transmit::sendmmsg_transmit(const options &opts, boost::asio::io_service &io_service)
     : socket(io_service)
 {
-    udp::resolver resolver(io_service);
-    udp::resolver::query query(udp::v4(), opts.host, opts.port);
-    udp::endpoint endpoint = *resolver.resolve(query);
-
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(endpoint.port());
-    addr.sin_addr.s_addr = htonl(endpoint.address().to_v4().to_ulong());
-
     socket.open(udp::v4());
     set_buffer_size(socket, opts.buffer_size);
     fd = socket.native_handle();
@@ -51,17 +43,21 @@ void sendmmsg_transmit::send_packets(std::size_t first, std::size_t last,
     (void) start; // unused;
     mmsghdr msg_vec[batch_size];
     iovec msg_iov[batch_size];
+    sockaddr_in addr[batch_size];
 
     assert(last - first <= batch_size);
     int next = 0;
     std::memset(&msg_vec, 0, sizeof(msg_vec));
     for (std::size_t i = first; i != last; ++i)
     {
-        msg_vec[next].msg_hdr.msg_name = (void *) &addr;
-        msg_vec[next].msg_hdr.msg_namelen = sizeof(addr);
+        packet pkt = collector.get_packet(i);
+        addr[next].sin_family = AF_INET;
+        addr[next].sin_addr.s_addr = pkt.dst_host;
+        addr[next].sin_port = pkt.dst_port;
+        msg_vec[next].msg_hdr.msg_name = (void *) &addr[next];
+        msg_vec[next].msg_hdr.msg_namelen = sizeof(addr[next]);
         msg_vec[next].msg_hdr.msg_iov = &msg_iov[next];
         msg_vec[next].msg_hdr.msg_iovlen = 1;
-        packet pkt = collector.get_packet(i);
         msg_iov[next].iov_base = const_cast<u_char *>(pkt.data);
         msg_iov[next].iov_len = pkt.len;
         next++;

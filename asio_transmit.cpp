@@ -24,9 +24,6 @@ using boost::asio::ip::udp;
 asio_transmit::asio_transmit(const options &opts, boost::asio::io_service &io_service)
     : socket(io_service)
 {
-    udp::resolver resolver(io_service);
-    udp::resolver::query query(udp::v4(), opts.host, opts.port);
-    endpoint = *resolver.resolve(query);
     socket.open(udp::v4());
     set_buffer_size(socket, opts.buffer_size);
 }
@@ -38,6 +35,11 @@ void asio_transmit::send_packets(std::size_t first, std::size_t last,
     for (std::size_t i = first; i < last; i++)
     {
         packet pkt = collector.get_packet(i);
+        udp::endpoint endpoint;
+        boost::asio::ip::address_v4::bytes_type host_raw;
+        std::memcpy(&host_raw, &pkt.dst_host, sizeof(host_raw));
+        endpoint.address(boost::asio::ip::address_v4(host_raw));
+        endpoint.port(ntohs(pkt.dst_port));
         socket.send_to(boost::asio::buffer(pkt.data, pkt.len), endpoint);
     }
 }

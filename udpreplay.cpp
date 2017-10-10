@@ -41,6 +41,8 @@ struct callback_data
     std::chrono::duration<double, duration::period> per_packet{0.0};
     std::chrono::duration<double, duration::period> per_byte{0.0};
     bool use_timestamps;
+    bool use_destination;
+    boost::asio::ip::udp::endpoint destination;
     struct timeval start;
     std::uint64_t packets = 0;
     std::uint64_t bytes = 0;
@@ -61,10 +63,14 @@ static void callback(u_char *user, const struct pcap_pkthdr *h, const u_char *by
         bytes += eth_hsize;
         len -= eth_hsize;
         const unsigned int ip_hsize = (bytes[0] & 0xf) * 4;
+        std::uint32_t dst_host;   // big endian
+        std::memcpy(&dst_host, bytes + 16, sizeof(dst_host));
         if (len >= ip_hsize + 8)
         {
             bytes += ip_hsize;
             len -= ip_hsize;
+            std::uint16_t dst_port;     // big endian
+            std::memcpy(&dst_port, bytes + 2, sizeof(dst_port));
             const unsigned int udp_hsize = 8;
             bytes += udp_hsize;
             len -= udp_hsize;
@@ -84,7 +90,13 @@ static void callback(u_char *user, const struct pcap_pkthdr *h, const u_char *by
                 timestamp = std::chrono::duration_cast<duration>(
                     data->per_byte * data->bytes + data->per_packet * data->packets);
             }
-            packet p = {bytes, len, timestamp};
+            if (!data->use_destination)
+            {
+                asio::ip::address_v4::bytes_type dst_raw = data->destination.address().to_v4().to_bytes();
+                std::memcpy(&dst_host, &dst_raw, sizeof(dst_host));
+                dst_port = htons(data->destination.port());
+            }
+            packet p = {bytes, len, timestamp, dst_host, dst_port};
             data->add_packet(p);
             data->packets++;
             data->bytes += len;
@@ -122,6 +134,13 @@ static void run(pcap_t *p, const options &opts)
     if (opts.pps != 0)
         data.per_packet = std::chrono::duration<double>(1.0 / opts.pps);
     data.use_timestamps = opts.use_timestamps;
+    data.use_destination = opts.use_destination;
+    if (!opts.use_destination)
+    {
+        udp::resolver resolver(io_service);
+        udp::resolver::query query(udp::v4(), opts.host, opts.port);
+        data.destination = *resolver.resolve(query);
+    }
     pcap_loop(p, -1, callback<Collector>, (u_char *) &data);
     std::size_t num_packets = collector.num_packets();
 
@@ -135,7 +154,7 @@ static void run(pcap_t *p, const options &opts)
     time_point start, rep_start, stop;
     start = std::chrono::high_resolution_clock::now();
     const std::size_t batch_size = opts.use_timestamps ? 1 : Transmit::batch_size;
-    for (int pass = 0; pass < opts.repeat; pass++)
+    for (std::size_t pass = 0; pass < opts.repeat; pass++)
     {
         rep_start = start + std::chrono::duration_cast<duration>(pass * rep_step);
         for (std::size_t i = 0; i < num_packets; i += batch_size)
@@ -167,6 +186,7 @@ static options parse_args(int argc, char **argv)
         ("pps", po::value<double>(&out.pps), "packets per second (0 for max speed)")
         ("mbps", po::value<double>(&out.mbps), "bits per second (0 for max speed)")
         ("use-timestamps", po::bool_switch(&out.use_timestamps)->default_value(defaults.use_timestamps), "use timestamps from the file for replay timing")
+        ("use-destination", po::bool_switch(&out.use_destination)->default_value(defaults.use_destination), "use original destination endpoints from the file")
         ("host", po::value<std::string>(&out.host)->default_value(defaults.host), "destination host")
         ("port", po::value<std::string>(&out.port)->default_value(defaults.port), "destination port")
         ("bind", po::value<std::string>(&out.bind)->default_value(defaults.bind), "local address (for multicast)")

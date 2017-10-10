@@ -35,6 +35,7 @@ struct options
     double pps = 0;
     double mbps = 0;
     bool use_timestamps = false;
+    bool use_destination = false;
     std::size_t buffer_size = 0;
     std::size_t repeat = 1;
     std::string mode = "asio";
@@ -49,6 +50,8 @@ struct packet
     const std::uint8_t *data;
     std::size_t len;
     duration timestamp;  // relative to start of capture
+    std::uint32_t dst_host;    // in big endian
+    std::uint16_t dst_port;    // in big endian
 };
 
 class basic_collector
@@ -59,6 +62,8 @@ private:
         std::size_t offset;
         std::size_t len;
         duration timestamp;
+        std::uint32_t dst_host;    // in big endian
+        std::uint16_t dst_port;    // in big endian
     };
 
     std::vector<std::uint8_t> storage;

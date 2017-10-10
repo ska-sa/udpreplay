@@ -34,7 +34,6 @@ private:
     basic_collector collector;
     boost::asio::ip::udp::socket socket;
     int fd;
-    sockaddr_in addr;
 
 public:
     typedef basic_collector collector_type;

@@ -26,7 +26,6 @@ class asio_transmit
 private:
     basic_collector collector;
     boost::asio::ip::udp::socket socket;
-    boost::asio::ip::udp::endpoint endpoint;
 
 public:
     static constexpr int batch_size = 1;
