@@ -53,11 +53,26 @@ option on Linux is `--mode sendmmsg`, which can increase performance.
 ## Infiniband Verbs API
 
 If your NIC supports the Infiniband Verbs API, you may be able to get higher
-performance by using it. It will be automatically detected at configure time.
+performance by passing `--mode=ibv`. Support will be automatically detected at
+configure time.
 
 There are some caveats. It can only be used with multicast destination
 addresses, and you must specify the interface to use by passing
 `--bind <ip-address>`.
+
+## Original timings
+
+Specifying `--use-timestamps` will attempt to replay the packets according to
+the timestamps in the original file. The mode is somewhat less efficient, so it
+might not keep up with the goal when packets are close together in time.
+
+## Original destinations
+
+Normally, udpreplay sends all the traffic to a specific host and port, ignoring
+the values in the original packets. With `--use-destination`, it will instead
+use the original IP address and port. Note that the MAC address is not used,
+even when using `--mode=ibv`, so if you edit the file to change the
+destination, it's not necessary to update the MAC address to match.
 
 ## License
 
