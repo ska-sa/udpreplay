@@ -151,6 +151,7 @@ static void run(pcap_t *p, const options &opts)
     else
         rep_step = data.per_byte * data.bytes + data.per_packet * data.packets;
 
+    std::cout << "Packets loading, starting transmission" << std::endl;
     time_point start, rep_start, stop;
     start = std::chrono::high_resolution_clock::now();
     const std::size_t batch_size = opts.use_timestamps ? 1 : Transmit::batch_size;
