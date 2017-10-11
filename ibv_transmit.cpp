@@ -148,9 +148,10 @@ ibv_collector::slab::slab(ibv_pd *pd, std::size_t capacity)
 ibv_collector::ibv_collector(
     ibv_pd *pd,
     const boost::asio::ip::udp::endpoint &src_endpoint,
-    const mac_address &src_mac,
+    const mac_address &src_mac, std::uint8_t ttl,
     std::size_t slab_size)
     : pd(pd), src_endpoint(src_endpoint), src_mac(src_mac),
+    ttl(ttl ? ttl : 1),
     slab_size(slab_size)
 {
 }
@@ -183,7 +184,7 @@ void ibv_collector::add_packet(const packet &pkt)
     // IP header
     std::uint8_t *ip = ether + 14;
     ip[0] = 0x45;  // Version 4, header length 20
-    ip[8] = 1;     // TTL
+    ip[8] = ttl;
     ip[9] = 0x11;  // Protocol: UDP
     auto src_addr = src_endpoint.address().to_v4().to_bytes();
     std::uint16_t length_ip = htons(pkt.len + 28);
@@ -335,7 +336,7 @@ ibv_transmit::ibv_transmit(const options &opts, boost::asio::io_service &io_serv
 
     collector.reset(new ibv_collector(
             pd.get(), src_endpoint,
-            get_mac(src_endpoint.address())));
+            get_mac(src_endpoint.address()), opts.ttl));
 }
 
 void ibv_transmit::send_packets(std::size_t first, std::size_t last,

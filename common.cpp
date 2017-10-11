@@ -69,3 +69,9 @@ void set_buffer_size(udp::socket &socket, std::size_t size)
         }
     }
 }
+
+void set_ttl(udp::socket &socket, std::uint8_t ttl)
+{
+    if (ttl != 0)
+        socket.set_option(boost::asio::ip::multicast::hops(ttl));
+}

@@ -37,6 +37,7 @@ struct options
     bool use_timestamps = false;
     bool use_destination = false;
     std::size_t buffer_size = 0;
+    std::uint8_t ttl = 0;
     std::size_t repeat = 1;
     std::string mode = "asio";
     std::string host = "localhost";
@@ -79,5 +80,6 @@ public:
 };
 
 void set_buffer_size(boost::asio::ip::udp::socket &socket, std::size_t size);
+void set_ttl(boost::asio::ip::udp::socket &socket, std::uint8_t ttl);
 
 #endif // UDPREPLAY_COMMON_H

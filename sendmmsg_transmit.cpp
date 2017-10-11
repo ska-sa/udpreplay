@@ -34,6 +34,7 @@ sendmmsg_transmit::sendmmsg_transmit(const options &opts, boost::asio::io_servic
 {
     socket.open(udp::v4());
     set_buffer_size(socket, opts.buffer_size);
+    set_ttl(socket, opts.ttl);
     fd = socket.native_handle();
 }
 

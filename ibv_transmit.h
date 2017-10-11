@@ -113,6 +113,7 @@ private:
     ibv_pd *pd;
     boost::asio::ip::udp::endpoint src_endpoint;
     mac_address src_mac;
+    std::uint8_t ttl;
     // Cannot use a vector, because it is non-copyable
     std::deque<frame> frames;
     std::vector<slab> slabs;
@@ -124,6 +125,7 @@ public:
         ibv_pd *pd,
         const boost::asio::ip::udp::endpoint &src_endpoint,
         const mac_address &src_mac,
+        std::uint8_t ttl,
         std::size_t slab_size = 64 * 1024 * 1024);
 
     void add_packet(const packet &pkt);

@@ -192,6 +192,7 @@ static options parse_args(int argc, char **argv)
         ("bind", po::value<std::string>(&out.bind)->default_value(defaults.bind), "local address (for multicast)")
         ("mode", po::value<std::string>(&out.mode)->default_value(defaults.mode), "transmit mode (asio/sendmmsg/ibv)")
         ("buffer-size", po::value<size_t>(&out.buffer_size)->default_value(defaults.buffer_size), "transmit buffer size (0 for system default)")
+        ("ttl", po::value<uint8_t>(&out.ttl)->default_value(defaults.ttl), "TTL for multicast (0 for system default)")
         ("repeat", po::value<size_t>(&out.repeat)->default_value(defaults.repeat), "send the data this many times")
         ;
 
