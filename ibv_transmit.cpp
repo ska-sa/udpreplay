@@ -127,7 +127,16 @@ allocate_huge(std::size_t size)
         nullptr, size, PROT_READ | PROT_WRITE, flags, -1, 0);
     if (ptr == MAP_FAILED)
     {
-        std::cerr << "Warning: hugetlb allocation failed, falling back to regular pages\n";
+        /* Note: this use of a static variable makes this function
+         * non-threadsafe. If it is even going to be used by multiple
+         * threads, it needs to be replaced by a std::once.
+         */
+        static bool warned = false;
+        if (!warned)
+        {
+            std::cerr << "Warning: hugetlb allocation failed, falling back to regular pages\n";
+            warned = true;
+        }
         flags &= ~MAP_HUGETLB;
         ptr = (std::uint8_t *) mmap(
             nullptr, size, PROT_READ | PROT_WRITE, flags, -1, 0);
