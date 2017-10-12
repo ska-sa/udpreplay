@@ -122,27 +122,28 @@ static std::uint16_t ip_checksum(const std::uint8_t *header)
 static std::unique_ptr<std::uint8_t[], mmap_deleter<std::uint8_t>>
 allocate_huge(std::size_t size)
 {
-    int flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB;
-    std::uint8_t *ptr = (std::uint8_t *) mmap(
-        nullptr, size, PROT_READ | PROT_WRITE, flags, -1, 0);
-    if (ptr == MAP_FAILED)
+    /* Note: this use of a static variable makes this function
+     * non-threadsafe. If it is even going to be used by multiple
+     * threads, it needs to be replaced by something thread-safe.
+     */
+    static bool huge_failed = false;
+    const int flags = MAP_PRIVATE | MAP_ANONYMOUS;
+    std::uint8_t *ptr = (std::uint8_t *) MAP_FAILED;
+    if (!huge_failed)
     {
-        /* Note: this use of a static variable makes this function
-         * non-threadsafe. If it is even going to be used by multiple
-         * threads, it needs to be replaced by a std::once.
-         */
-        static bool warned = false;
-        if (!warned)
+        std::uint8_t *ptr = (std::uint8_t *) mmap(
+            nullptr, size, PROT_READ | PROT_WRITE, flags | MAP_HUGETLB, -1, 0);
+        if (ptr == MAP_FAILED)
         {
             std::cerr << "Warning: hugetlb allocation failed, falling back to regular pages\n";
-            warned = true;
+            huge_failed = true;
         }
-        flags &= ~MAP_HUGETLB;
+    }
+    if (ptr == MAP_FAILED)
         ptr = (std::uint8_t *) mmap(
             nullptr, size, PROT_READ | PROT_WRITE, flags, -1, 0);
-        if (ptr == MAP_FAILED)
-            throw std::bad_alloc();
-    }
+    if (ptr == MAP_FAILED)
+        throw std::bad_alloc();
     return {ptr, mmap_deleter<std::uint8_t>(size)};
 }
 
