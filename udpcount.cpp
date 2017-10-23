@@ -38,11 +38,13 @@
 #include <net/if.h>
 #include <poll.h>
 #include <sched.h>
-#include <linux/if_packet.h>
-#include <linux/if_ether.h>
-#include <linux/ip.h>
-#include <linux/udp.h>
-#include <linux/filter.h>
+#if HAVE_LINUX_IF_PACKET_H
+# include <linux/if_packet.h>
+# include <linux/if_ether.h>
+# include <linux/ip.h>
+# include <linux/udp.h>
+# include <linux/filter.h>
+#endif
 
 namespace asio = boost::asio;
 namespace po = boost::program_options;
@@ -467,6 +469,7 @@ public:
     }
 };
 
+#if HAVE_LINUX_IF_PACKET_H
 class pfpacket_runner : public socket_runner<std::atomic<std::int64_t>>
 {
 private:
@@ -703,18 +706,22 @@ public:
         }
     }
 };
+#endif  // HAVE_LINUX_IF_PACKET_H
 
 int main(int argc, char **argv)
 {
     try
     {
         options opts = parse_args(argc, argv);
+#if HAVE_LINUX_IF_PACKET_H
         if (opts.mode == "pfpacket")
         {
             pfpacket_runner r(opts);
             r.run();
         }
-        else if (opts.mode == "pcap")
+        else
+#endif // HAVE_LINUX_IF_PACKET_H
+        if (opts.mode == "pcap")
         {
             pcap_runner r(opts);
             r.run();
