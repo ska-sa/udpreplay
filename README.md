@@ -13,6 +13,10 @@ The packets are pre-loaded from the pcap file, so it is possible to send at a
 higher rate than the packets can be loaded. Typically, the NIC or the kernel
 limits the maximum rate.
 
+Instead of providing a pcap file, one can provide a number, which is used as a
+packet size (specifically, the UDP payload size), and generates an infinite
+stream of packets (or a finite stream if `--repeat` is used).
+
 ## udpcount
 
 An extra tool is included, called `udpcount`. It listens for UDP packets on a

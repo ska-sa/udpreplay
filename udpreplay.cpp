@@ -1,4 +1,4 @@
-/* Copyright 2015-2016 SKA South Africa
+/* Copyright 2015-2016, 2018 SKA South Africa
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -25,6 +25,7 @@
 #include <system_error>
 #include <pcap.h>
 #include <boost/program_options.hpp>
+#include <boost/lexical_cast.hpp>
 #include "common.h"
 #include "asio_transmit.h"
 #include "sendmmsg_transmit.h"
@@ -48,7 +49,6 @@ struct callback_data
     std::uint64_t bytes = 0;
 };
 
-template<typename Collector>
 static void callback(u_char *user, const struct pcap_pkthdr *h, const u_char *bytes)
 {
     const unsigned int eth_hsize = 14;
@@ -104,6 +104,29 @@ static void callback(u_char *user, const struct pcap_pkthdr *h, const u_char *by
     }
 }
 
+static void generate_packets(callback_data &data, std::size_t packet_size)
+{
+    std::unique_ptr<uint8_t[]> payload{new uint8_t[packet_size]};
+    std::fill(payload.get(), payload.get() + packet_size, 0);
+
+    std::uint32_t dst_host;   // big endian
+    asio::ip::address_v4::bytes_type dst_raw = data.destination.address().to_v4().to_bytes();
+    std::memcpy(&dst_host, &dst_raw, sizeof(dst_host));
+    std::uint16_t dst_port = htons(data.destination.port());  // big endian
+
+    // Put in a reasonable number of packets, because there are overheads if
+    // we can't batch things.
+    for (int i = 0; i < 1024; i++)
+    {
+        duration timestamp = std::chrono::duration_cast<duration>(
+            data.per_byte * data.bytes + data.per_packet * data.packets);
+        packet p = {payload.get(), packet_size, timestamp, dst_host, dst_port};
+        data.add_packet(p);
+        data.packets++;
+        data.bytes += packet_size;
+    }
+}
+
 static void prepare(pcap_t *p)
 {
     struct bpf_program fp;
@@ -141,7 +164,12 @@ static void run(pcap_t *p, const options &opts)
         udp::resolver::query query(udp::v4(), opts.host, opts.port);
         data.destination = *resolver.resolve(query);
     }
-    pcap_loop(p, -1, callback<Collector>, (u_char *) &data);
+
+    if (p)
+        pcap_loop(p, -1, callback, (u_char *) &data);
+    else
+        generate_packets(data, opts.packet_size);
+
     std::size_t num_packets = collector.num_packets();
 
     /* Time offset between the equivalent packets in each repetition. */
@@ -155,10 +183,30 @@ static void run(pcap_t *p, const options &opts)
     time_point start, rep_start, stop;
     start = std::chrono::high_resolution_clock::now();
     const std::size_t batch_size = opts.use_timestamps ? 1 : Transmit::batch_size;
-    for (std::size_t pass = 0; pass < opts.repeat; pass++)
+
+    std::uint64_t passes = 0;
+    std::uint64_t last_pass = 0;
+    bool forever = false;
+    if (opts.repeat == 0)
+        forever = true;
+    else if (!p)
+    {
+        // --repeat specifies number of packets to send, but we have a number of
+        // packets in the collector so we have to break it into repeats plus
+        // final pass.
+        passes = opts.repeat / num_packets;
+        last_pass = opts.repeat % num_packets;
+    }
+    else
+    {
+        passes = opts.repeat;
+    }
+
+    for (std::uint64_t pass = 0; forever || pass <= passes; pass++)
     {
         rep_start = start + std::chrono::duration_cast<duration>(pass * rep_step);
-        for (std::size_t i = 0; i < num_packets; i += batch_size)
+        std::size_t limit = (pass < passes) ? num_packets : last_pass;
+        for (std::size_t i = 0; i < limit; i += batch_size)
         {
             std::size_t end = std::min(i + batch_size, num_packets);
             t.send_packets(i, end, rep_start);
@@ -167,11 +215,15 @@ static void run(pcap_t *p, const options &opts)
     t.flush();
     stop = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double> elapsed = stop - start;
-    std::uint64_t bytes = collector.bytes() * opts.repeat;
+    std::uint64_t total_bytes = collector.bytes() * passes;
+    std::uint64_t total_packets = num_packets * passes + last_pass;
+    for (std::size_t i = 0; i < last_pass; i++)
+        total_bytes += collector.packet_size(i);
 
     double time = elapsed.count();
-    std::cout << "Transmitted " << bytes << " bytes in " << time << "s = "
-        << bytes * 8.0 / time / 1e9 << "Gbps\n";
+    std::cout << "Transmitted " << total_bytes << " bytes / "
+        << total_packets << " packets in " << time << "s = "
+        << total_bytes * 8.0 / time / 1e9 << "Gbps\n";
 }
 
 static options parse_args(int argc, char **argv)
@@ -194,7 +246,7 @@ static options parse_args(int argc, char **argv)
         ("mode", po::value<std::string>(&out.mode)->default_value(defaults.mode), "transmit mode (asio/sendmmsg/ibv)")
         ("buffer-size", po::value<size_t>(&out.buffer_size)->default_value(defaults.buffer_size), "transmit buffer size (0 for system default)")
         ("ttl", po::value<uint8_t>(&out.ttl)->default_value(defaults.ttl), "TTL for multicast (0 for system default)")
-        ("repeat", po::value<size_t>(&out.repeat)->default_value(defaults.repeat), "send the data this many times")
+        ("repeat", po::value<size_t>(&out.repeat), "send the data this many times")
         ;
 
     po::options_description hidden;
@@ -216,12 +268,30 @@ static options parse_args(int argc, char **argv)
         po::notify(vm);
         if (vm.count("pps") + vm.count("mbps") + out.use_timestamps > 1)
             throw po::error("Cannot specify more than one of --pps, --mbps and --use-timestamps");
+        try
+        {
+            // See if we were given a packet size instead of a file
+            out.packet_size = boost::lexical_cast<int>(out.input_file);
+            out.input_file = "";
+            if (out.packet_size <= 0)
+                throw po::error("Packet size must be positive");
+            if (out.use_timestamps)
+                throw po::error("Cannot use --use-timestamps with packet generator");
+            if (out.use_destination)
+                throw po::error("Cannot use --use-destination with packet generator");
+            if (!vm.count("repeat"))
+                out.repeat = 0;   // run forever
+        }
+        catch (boost::bad_lexical_cast)
+        {
+            // It's a filename
+        }
         return out;
     }
     catch (po::error &e)
     {
         std::cerr << e.what() << "\n\n";
-        std::cerr << "Usage: udpreplay [options] capturefile\n";
+        std::cerr << "Usage: udpreplay [options] capturefile|packet-size\n";
         std::cerr << desc;
         throw;
     }
@@ -244,8 +314,12 @@ int main(int argc, char **argv)
     try
     {
         options opts = parse_args(argc, argv);
-        std::shared_ptr<pcap_t> p = open_capture(opts);
-        prepare(p.get());
+        std::shared_ptr<pcap_t> p;
+        if (opts.packet_size == 0)
+        {
+            p = open_capture(opts);
+            prepare(p.get());
+        }
 #if HAVE_SENDMMSG
         if (opts.mode == "sendmmsg")
         {

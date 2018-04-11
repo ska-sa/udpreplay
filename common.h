@@ -38,12 +38,13 @@ struct options
     bool use_destination = false;
     std::size_t buffer_size = 0;
     std::uint8_t ttl = 0;
-    std::size_t repeat = 1;
+    std::uint64_t repeat = 1;
     std::string mode = "asio";
     std::string host = "localhost";
     std::string port = "8888";
     std::string bind = "";
     std::string input_file;
+    int packet_size = 0;
 };
 
 struct packet
