@@ -205,7 +205,7 @@ static void run(pcap_t *p, const options &opts)
     for (std::uint64_t pass = 0; forever || pass <= passes; pass++)
     {
         rep_start = start + std::chrono::duration_cast<duration>(pass * rep_step);
-        std::size_t limit = (pass < passes) ? num_packets : last_pass;
+        std::size_t limit = (forever || pass < passes) ? num_packets : last_pass;
         for (std::size_t i = 0; i < limit; i += batch_size)
         {
             std::size_t end = std::min(i + batch_size, num_packets);
