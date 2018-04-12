@@ -208,7 +208,7 @@ static void run(pcap_t *p, const options &opts)
         std::size_t limit = (forever || pass < passes) ? num_packets : last_pass;
         for (std::size_t i = 0; i < limit; i += batch_size)
         {
-            std::size_t end = std::min(i + batch_size, num_packets);
+            std::size_t end = std::min(i + batch_size, limit);
             t.send_packets(i, end, rep_start);
         }
     }
