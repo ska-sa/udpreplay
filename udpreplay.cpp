@@ -104,7 +104,7 @@ static void callback(u_char *user, const struct pcap_pkthdr *h, const u_char *by
     }
 }
 
-static void generate_packets(callback_data &data, std::size_t packet_size)
+static void generate_packets(callback_data &data, std::size_t packet_size, int addresses)
 {
     std::unique_ptr<uint8_t[]> payload{new uint8_t[packet_size]};
     std::fill(payload.get(), payload.get() + packet_size, 0);
@@ -112,12 +112,18 @@ static void generate_packets(callback_data &data, std::size_t packet_size)
     std::uint32_t dst_host;   // big endian
     asio::ip::address_v4::bytes_type dst_raw = data.destination.address().to_v4().to_bytes();
     std::memcpy(&dst_host, &dst_raw, sizeof(dst_host));
+    std::uint32_t dst_host_he = ntohl(dst_host);  // host endian
     std::uint16_t dst_port = htons(data.destination.port());  // big endian
 
     // Put in a reasonable number of packets, because there are overheads if
     // we can't batch things.
-    for (int i = 0; i < 1024; i++)
+    int batch_size = 1024;
+    // Round up to a multiple of the number of addresses
+    batch_size = (batch_size + addresses - 1) / addresses * addresses;
+    for (int i = 0; i < batch_size; i++)
     {
+        std::uint32_t dst_host_cur_he = (dst_host_he + i % addresses);
+        dst_host = htonl(dst_host_cur_he);
         duration timestamp = std::chrono::duration_cast<duration>(
             data.per_byte * data.bytes + data.per_packet * data.packets);
         packet p = {payload.get(), packet_size, timestamp, dst_host, dst_port};
@@ -168,7 +174,7 @@ static void run(pcap_t *p, const options &opts)
     if (p)
         pcap_loop(p, -1, callback, (u_char *) &data);
     else
-        generate_packets(data, opts.packet_size);
+        generate_packets(data, opts.packet_size, opts.addresses);
 
     std::size_t num_packets = collector.num_packets();
 
@@ -247,6 +253,7 @@ static options parse_args(int argc, char **argv)
         ("buffer-size", po::value<size_t>(&out.buffer_size)->default_value(defaults.buffer_size), "transmit buffer size (0 for system default)")
         ("ttl", po::value<uint8_t>(&out.ttl)->default_value(defaults.ttl), "TTL for multicast (0 for system default)")
         ("repeat", po::value<size_t>(&out.repeat), "send the data this many times")
+        ("addresses", po::value<int>(&out.addresses)->default_value(defaults.addresses), "number of sequential addresses to use with generator")
         ;
 
     po::options_description hidden;
@@ -279,12 +286,16 @@ static options parse_args(int argc, char **argv)
                 throw po::error("Cannot use --use-timestamps with packet generator");
             if (out.use_destination)
                 throw po::error("Cannot use --use-destination with packet generator");
+            if (out.addresses < 1)
+                throw po::error("Value of --addresses cannot be less than 1");
             if (!vm.count("repeat"))
                 out.repeat = 0;   // run forever
         }
         catch (boost::bad_lexical_cast)
         {
             // It's a filename
+            if (out.addresses != 1)
+                throw po::error("Cannot use --addresses with a capture file");
         }
         return out;
     }

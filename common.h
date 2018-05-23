@@ -45,6 +45,7 @@ struct options
     std::string bind = "";
     std::string input_file;
     int packet_size = 0;
+    int addresses = 1;
 };
 
 struct packet
