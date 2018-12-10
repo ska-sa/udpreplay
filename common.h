@@ -36,6 +36,7 @@ struct options
     double mbps = 0;
     bool use_timestamps = false;
     bool use_destination = false;
+    bool pause = false;
     std::size_t buffer_size = 0;
     std::uint8_t ttl = 0;
     std::uint64_t repeat = 1;

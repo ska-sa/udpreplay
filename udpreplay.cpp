@@ -193,7 +193,7 @@ static void run(pcap_t *p, const options &opts)
     std::uint64_t passes = 0;
     std::uint64_t last_pass = 0;
     bool forever = false;
-    if (opts.repeat == 0)
+    if (opts.repeat == 0 || (opts.repeat == 1 && opts.pause))
         forever = true;
     else if (!p)
     {
@@ -216,6 +216,13 @@ static void run(pcap_t *p, const options &opts)
         {
             std::size_t end = std::min(i + batch_size, limit);
             t.send_packets(i, end, rep_start);
+        }
+        if (opts.pause)
+        {
+            t.flush();
+            std::cout << "Press enter when ready for next repetition: " << std::flush;
+            std::string dummy;
+            getline(std::cin, dummy);
         }
     }
     t.flush();
@@ -254,6 +261,7 @@ static options parse_args(int argc, char **argv)
         ("ttl", po::value<uint8_t>(&out.ttl)->default_value(defaults.ttl), "TTL for multicast (0 for system default)")
         ("repeat", po::value<size_t>(&out.repeat), "send the data this many times")
         ("addresses", po::value<int>(&out.addresses)->default_value(defaults.addresses), "number of sequential addresses to use with generator")
+        ("pause", po::bool_switch(&out.pause)->default_value(defaults.pause), "wait for user input after each repetition")
         ;
 
     po::options_description hidden;
