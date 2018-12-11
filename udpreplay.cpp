@@ -186,57 +186,60 @@ static void run(pcap_t *p, const options &opts)
         rep_step = data.per_byte * data.bytes + data.per_packet * data.packets;
 
     std::cout << "Packets loading, starting transmission" << std::endl;
-    time_point start, rep_start, stop;
-    start = std::chrono::high_resolution_clock::now();
-    const std::size_t batch_size = opts.use_timestamps ? 1 : Transmit::batch_size;
 
-    std::uint64_t passes = 0;
-    std::uint64_t last_pass = 0;
-    bool forever = false;
-    if (opts.repeat == 0 || (opts.repeat == 1 && opts.pause))
-        forever = true;
-    else if (!p)
+    do
     {
-        // --repeat specifies number of packets to send, but we have a number of
-        // packets in the collector so we have to break it into repeats plus
-        // final pass.
-        passes = opts.repeat / num_packets;
-        last_pass = opts.repeat % num_packets;
-    }
-    else
-    {
-        passes = opts.repeat;
-    }
+        time_point start, rep_start, stop;
+        start = std::chrono::high_resolution_clock::now();
+        const std::size_t batch_size = opts.use_timestamps ? 1 : Transmit::batch_size;
 
-    for (std::uint64_t pass = 0; forever || pass <= passes; pass++)
-    {
-        rep_start = start + std::chrono::duration_cast<duration>(pass * rep_step);
-        std::size_t limit = (forever || pass < passes) ? num_packets : last_pass;
-        for (std::size_t i = 0; i < limit; i += batch_size)
+        std::uint64_t passes = 0;
+        std::uint64_t last_pass = 0;
+        bool forever = false;
+        if (opts.repeat == 0)
+            forever = true;
+        else if (!p)
         {
-            std::size_t end = std::min(i + batch_size, limit);
-            t.send_packets(i, end, rep_start);
+            // --repeat specifies number of packets to send, but we have a number of
+            // packets in the collector so we have to break it into repeats plus
+            // final pass.
+            passes = opts.repeat / num_packets;
+            last_pass = opts.repeat % num_packets;
         }
+        else
+        {
+            passes = opts.repeat;
+        }
+
+        for (std::uint64_t pass = 0; forever || pass <= passes; pass++)
+        {
+            rep_start = start + std::chrono::duration_cast<duration>(pass * rep_step);
+            std::size_t limit = (forever || pass < passes) ? num_packets : last_pass;
+            for (std::size_t i = 0; i < limit; i += batch_size)
+            {
+                std::size_t end = std::min(i + batch_size, limit);
+                t.send_packets(i, end, rep_start);
+            }
+        }
+        t.flush();
+        stop = std::chrono::high_resolution_clock::now();
+        std::chrono::duration<double> elapsed = stop - start;
+        std::uint64_t total_bytes = collector.bytes() * passes;
+        std::uint64_t total_packets = num_packets * passes + last_pass;
+        for (std::size_t i = 0; i < last_pass; i++)
+            total_bytes += collector.packet_size(i);
+
+        double time = elapsed.count();
+        std::cout << "Transmitted " << total_bytes << " bytes / "
+            << total_packets << " packets in " << time << "s = "
+            << total_bytes * 8.0 / time / 1e9 << "Gbps\n";
         if (opts.pause)
         {
-            t.flush();
             std::cout << "Press enter when ready for next repetition: " << std::flush;
             std::string dummy;
             getline(std::cin, dummy);
         }
-    }
-    t.flush();
-    stop = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<double> elapsed = stop - start;
-    std::uint64_t total_bytes = collector.bytes() * passes;
-    std::uint64_t total_packets = num_packets * passes + last_pass;
-    for (std::size_t i = 0; i < last_pass; i++)
-        total_bytes += collector.packet_size(i);
-
-    double time = elapsed.count();
-    std::cout << "Transmitted " << total_bytes << " bytes / "
-        << total_packets << " packets in " << time << "s = "
-        << total_bytes * 8.0 / time / 1e9 << "Gbps\n";
+    } while (opts.pause);
 }
 
 static options parse_args(int argc, char **argv)
@@ -261,7 +264,7 @@ static options parse_args(int argc, char **argv)
         ("ttl", po::value<uint8_t>(&out.ttl)->default_value(defaults.ttl), "TTL for multicast (0 for system default)")
         ("repeat", po::value<size_t>(&out.repeat), "send the data this many times")
         ("addresses", po::value<int>(&out.addresses)->default_value(defaults.addresses), "number of sequential addresses to use with generator")
-        ("pause", po::bool_switch(&out.pause)->default_value(defaults.pause), "wait for user input after each repetition")
+        ("pause", po::bool_switch(&out.pause)->default_value(defaults.pause), "after completion, wait for user input then send again")
         ;
 
     po::options_description hidden;
@@ -305,6 +308,8 @@ static options parse_args(int argc, char **argv)
             if (out.addresses != 1)
                 throw po::error("Cannot use --addresses with a capture file");
         }
+        if (out.repeat == 0 && out.pause)
+            throw po::error("Cannot use --repeat=0 with --pause");
         return out;
     }
     catch (po::error &e)
