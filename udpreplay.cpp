@@ -302,7 +302,7 @@ static options parse_args(int argc, char **argv)
             if (!vm.count("repeat"))
                 out.repeat = 0;   // run forever
         }
-        catch (boost::bad_lexical_cast)
+        catch (boost::bad_lexical_cast &)
         {
             // It's a filename
             if (out.addresses != 1)
