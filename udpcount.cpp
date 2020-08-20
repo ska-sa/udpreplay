@@ -436,7 +436,8 @@ public:
 
     file_descriptor(file_descriptor &&other) : fd(other.fd)
     {
-        other.fd = -1;
+        if (this != &other)
+            other.fd = -1;
     }
 
     ~file_descriptor()
@@ -458,8 +459,11 @@ public:
 
     memory_map(memory_map &&other) : ptr(other.ptr), length(other.length)
     {
-        other.ptr = NULL;
-        other.length = 0;
+        if (this != &other)
+        {
+            other.ptr = NULL;
+            other.length = 0;
+        }
     }
 
     ~memory_map()
