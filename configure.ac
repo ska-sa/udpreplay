@@ -35,11 +35,13 @@ AC_CHECK_LIB([pcap], [pcap_fopen_offline], [], [AC_MSG_FAILURE([pcap library not
 
 # Check for optional features
 AC_CHECK_FUNCS([sendmmsg])
+AC_CHECK_FUNCS([recvmmsg])
 have_ibv=1
 AC_CHECK_LIB([ibverbs], [ibv_get_device_list], [], [have_ibv=0])
 AC_CHECK_LIB([rdmacm], [rdma_create_id], [], [have_ibv=0])
 AC_DEFINE_UNQUOTED([HAVE_IBV], [$have_ibv], [Whether ibverbs API is available])
 AC_CHECK_HEADERS([linux/if_packet.h])
+AC_CHECK_HEADERS([sys/timerfd.h])
 
 # Report results
 have_ibv_yesno=yes
