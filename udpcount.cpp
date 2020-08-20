@@ -371,13 +371,15 @@ private:
     std::vector<std::uint8_t> buffer;
     std::vector<struct mmsghdr> msgvec;
     std::vector<struct iovec> iovec;
+    const int n_poll;
+
     static constexpr int batch_size = 64;
 
 public:
     explicit recvmmsg_runner(const options &opts)
         : socket_runner<std::int64_t>(opts),
         buffer(std::max(opts.buffer_size, batch_size * opts.packet_size)),
-        msgvec(batch_size), iovec(batch_size)
+        msgvec(batch_size), iovec(batch_size), n_poll(opts.poll)
     {
         prepare_socket(opts);
         for (int i = 0; i < batch_size; i++)
@@ -402,20 +404,21 @@ public:
             throw_errno();
     }
 
-    void process_packets()
+    bool process_packets()
     {
         int result = recvmmsg(socket.native_handle(), msgvec.data(), msgvec.size(), 0, NULL);
         if (result < 0)
         {
             if (errno != EAGAIN)
                 throw_errno();
-            return;
+            return false;
         }
         for (int i = 0; i < result; i++)
         {
             bool trunc = (msgvec[i].msg_hdr.msg_flags & MSG_TRUNC);
             counters.add_packet(msgvec[i].msg_len, trunc);
         }
+        return true;
     }
 
     void run()
@@ -436,7 +439,11 @@ public:
             if (result < 0)
                 throw_errno();
             if (fds[0].revents & POLLIN)
-                process_packets();
+            {
+                for (int i = 0; i <= n_poll; i++)
+                    if (!process_packets())
+                        break;
+            }
             if (fds[1].revents & POLLIN)
             {
                 uint64_t fired;
