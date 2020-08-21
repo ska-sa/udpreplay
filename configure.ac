@@ -42,6 +42,8 @@ AC_CHECK_LIB([rdmacm], [rdma_create_id], [], [have_ibv=0])
 AC_DEFINE_UNQUOTED([HAVE_IBV], [$have_ibv], [Whether ibverbs API is available])
 AC_CHECK_HEADERS([linux/if_packet.h])
 AC_CHECK_HEADERS([sys/timerfd.h])
+AC_CHECK_HEADERS([liburing.h])
+AC_CHECK_LIB([uring], [io_uring_submit])
 
 # Report results
 have_ibv_yesno=yes
@@ -53,6 +55,7 @@ AC_MSG_NOTICE([[
 
 The following optional features will be included:
 
+    recvmmsg: $ac_cv_func_recvmmsg
     sendmmsg: $ac_cv_func_sendmmsg
     ibverbs:  $have_ibv_yesno
     pfpacket: $ac_cv_header_linux_if_packet_h

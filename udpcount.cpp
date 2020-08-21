@@ -55,6 +55,16 @@
 # include <sys/timerfd.h>
 #endif
 
+#if HAVE_LIBURING && HAVE_LIBURING_H
+# define USE_IO_URING 1
+#else
+# define USE_IO_URING 0
+#endif
+#if USE_IO_URING
+# include <liburing.h>
+# include <sys/timerfd.h>
+#endif
+
 namespace asio = boost::asio;
 namespace po = boost::program_options;
 using boost::asio::ip::udp;
@@ -73,9 +83,14 @@ struct options
     bool affinity = false;
 };
 
+[[noreturn]] static void throw_errno(int err)
+{
+    throw std::system_error(err, std::system_category());
+}
+
 [[noreturn]] static void throw_errno()
 {
-    throw std::system_error(errno, std::system_category());
+    throw_errno(errno);
 }
 
 static options parse_args(int argc, char **argv)
@@ -91,7 +106,7 @@ static options parse_args(int argc, char **argv)
         ("buffer-size", po::value<std::size_t>(&out.buffer_size)->default_value(out.buffer_size), "size of receive arena (0 for packet size)")
         ("poll", po::value<int>(&out.poll)->default_value(out.poll), "make up to this many synchronous reads")
         ("interface,i", po::value<std::string>(&out.interface)->default_value(out.interface), "interface to bind (not all modes)")
-        ("mode,m", po::value<std::string>(&out.mode)->default_value(out.mode), "capture mode (asio/recvmmsg/pcap/pfpacket)")
+        ("mode,m", po::value<std::string>(&out.mode)->default_value(out.mode), "capture mode (asio/recvmmsg/pcap/pfpacket/io_uring)")
         ("threads,t", po::value<int>(&out.threads)->default_value(out.threads), "number of threads (0 for auto) (not all modes)")
         ("affinity", po::bool_switch(&out.affinity)->default_value(out.affinity), "use CPU affinity (not all modes)")
         ;
@@ -227,6 +242,7 @@ protected:
     explicit socket_runner(const options &opts) : runner<T>(opts), socket(this->io_service)
     {
         socket.open(udp::v4());
+        socket.set_option(udp::socket::reuse_address());
         socket.bind(this->local_endpoint);
     }
 
@@ -462,7 +478,113 @@ public:
         }
     }
 };
-#endif
+#endif  // USE_RECVMMSG
+
+#if USE_IO_URING
+class io_uring_runner : public socket_runner<std::int64_t>
+{
+private:
+    io_uring ring;
+    std::vector<std::uint8_t> buffer;
+    std::vector<struct iovec> iovec;
+    std::vector<struct msghdr> msgvec;
+    file_descriptor timerfd;
+    struct iovec timer_iovec;
+    std::uint64_t timer_data;
+
+    static constexpr int entries = 64;
+    static constexpr int depth = entries - 1;  // one slot reserved for timeout
+
+public:
+    explicit io_uring_runner(const options &opts)
+        : socket_runner<std::int64_t>(opts),
+        buffer(std::max(opts.buffer_size, depth * opts.packet_size)),
+        iovec(depth), msgvec(depth)
+    {
+        // TODO: this code is mostly duplicated with recvmmsg_runner
+        int fd = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC);
+        if (fd < 0)
+            throw_errno();
+        timerfd = file_descriptor(fd);
+        itimerspec spec;
+        spec.it_interval.tv_sec = 1;
+        spec.it_interval.tv_nsec = 0;
+        spec.it_value = spec.it_interval;
+        if (timerfd_settime(fd, 0, &spec, NULL) < 0)
+            throw_errno();
+        timer_iovec.iov_base = &timer_data;
+        timer_iovec.iov_len = sizeof(timer_data);
+
+        prepare_socket(opts);
+        socket.non_blocking(false);
+        int result = io_uring_queue_init(entries, &ring, 0);
+        if (result < 0)
+            throw_errno(-result);
+
+        for (int i = 0; i < depth; i++)
+        {
+            iovec[i].iov_base = buffer.data() + i * opts.packet_size;
+            iovec[i].iov_len = opts.packet_size;
+            std::memset(&msgvec[i], 0, sizeof(msgvec[i]));
+            msgvec[i].msg_iov = &iovec[i];
+            msgvec[i].msg_iovlen = 1;
+        }
+    }
+
+    ~io_uring_runner()
+    {
+        io_uring_queue_exit(&ring);
+    }
+
+    void run()
+    {
+        for (int i = 0; i < depth; i++)
+        {
+            io_uring_sqe *sqe = io_uring_get_sqe(&ring);
+            io_uring_prep_recvmsg(sqe, socket.native_handle(), &msgvec[i], 0);
+            io_uring_sqe_set_data(sqe, &msgvec[i]);
+        }
+        io_uring_sqe *sqe = io_uring_get_sqe(&ring);
+        io_uring_prep_readv(sqe, timerfd.fd, &timer_iovec, 1, 0);
+        io_uring_sqe_set_data(sqe, &timer_data);
+        io_uring_submit(&ring);
+
+        auto alarm_time = std::chrono::steady_clock::now();
+        while (true)
+        {
+            io_uring_cqe *cqe;
+            int ret = io_uring_wait_cqe(&ring, &cqe);
+            if (ret < 0)
+                throw_errno(-ret);
+            if (cqe->res < 0)
+            {
+                int err = -cqe->res;
+                io_uring_cqe_seen(&ring, cqe);
+                throw_errno(err);
+            }
+            if ((void *) cqe->user_data == &timer_data)
+            {
+                alarm_time += std::chrono::seconds(timer_data);
+                sqe = io_uring_get_sqe(&ring);
+                io_uring_prep_readv(sqe, timerfd.fd, &timer_iovec, 1, 0);
+                io_uring_sqe_set_data(sqe, &timer_data);
+                show_stats(alarm_time);
+            }
+            else
+            {
+                msghdr *hdr = (msghdr *) cqe->user_data;
+                bool trunc = (hdr->msg_flags & MSG_TRUNC);
+                counters.add_packet(cqe->res, trunc);
+                sqe = io_uring_get_sqe(&ring);
+                io_uring_prep_recvmsg(sqe, socket.native_handle(), hdr, 0);
+                io_uring_sqe_set_data(sqe, hdr);
+            }
+            io_uring_cqe_seen(&ring, cqe);
+            io_uring_submit(&ring);    // TODO: use submit-and-wait
+        }
+    }
+};
+#endif  // USE_IO_URING
 
 class pcap_runner : public socket_runner<std::int64_t>
 {
@@ -852,6 +974,14 @@ int main(int argc, char **argv)
         if (opts.mode == "recvmmsg")
         {
             recvmmsg_runner r(opts);
+            r.run();
+        }
+        else
+#endif
+#if USE_IO_URING
+        if (opts.mode == "io_uring")
+        {
+            io_uring_runner r(opts);
             r.run();
         }
         else
