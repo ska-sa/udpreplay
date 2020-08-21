@@ -1,4 +1,4 @@
-/* Copyright 2015 SKA South Africa
+/* Copyright 2015, 2020 SKA South Africa
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -46,6 +46,15 @@
 # include <linux/filter.h>
 #endif
 
+#if HAVE_RECVMMSG && HAVE_SYS_TIMERFD_H
+# define USE_RECVMMSG 1
+#else
+# define USE_RECVMMSG 0
+#endif
+#if USE_RECVMMSG
+# include <sys/timerfd.h>
+#endif
+
 namespace asio = boost::asio;
 namespace po = boost::program_options;
 using boost::asio::ip::udp;
@@ -82,7 +91,7 @@ static options parse_args(int argc, char **argv)
         ("buffer-size", po::value<std::size_t>(&out.buffer_size)->default_value(out.buffer_size), "size of receive arena (0 for packet size)")
         ("poll", po::value<int>(&out.poll)->default_value(out.poll), "make up to this many synchronous reads")
         ("interface,i", po::value<std::string>(&out.interface)->default_value(out.interface), "interface to bind (not all modes)")
-        ("mode,m", po::value<std::string>(&out.mode)->default_value(out.mode), "capture mode (asio/pcap/pfpacket)")
+        ("mode,m", po::value<std::string>(&out.mode)->default_value(out.mode), "capture mode (asio/recvmmsg/pcap/pfpacket)")
         ("threads,t", po::value<int>(&out.threads)->default_value(out.threads), "number of threads (0 for auto) (not all modes)")
         ("affinity", po::bool_switch(&out.affinity)->default_value(out.affinity), "use CPU affinity (not all modes)")
         ;
@@ -194,7 +203,7 @@ protected:
         last_stats = now;
     }
 
-    explicit runner(const options &opts)
+    explicit runner(const options &opts) : last_stats(std::chrono::steady_clock::now())
     {
         udp::resolver resolver(io_service);
         udp::resolver::query query(
@@ -219,6 +228,23 @@ protected:
     {
         socket.open(udp::v4());
         socket.bind(this->local_endpoint);
+    }
+
+    // Prepare socket for use in the data plane
+    void prepare_socket(const options &opts)
+    {
+        socket.non_blocking(true);
+        if (opts.socket_size != 0)
+        {
+            socket.set_option(udp::socket::receive_buffer_size(opts.socket_size));
+            udp::socket::receive_buffer_size actual;
+            socket.get_option(actual);
+            if ((std::size_t) actual.value() != opts.socket_size)
+            {
+                std::cerr << "Warning: requested socket buffer size of " << opts.socket_size
+                    << " but actual size is " << actual.value() << '\n';
+            }
+        }
     }
 };
 
@@ -293,18 +319,7 @@ public:
         : socket_runner<std::int64_t>(opts), timer(io_service),
         buffer(std::max(opts.packet_size, opts.buffer_size)), packet_size(opts.packet_size), poll(opts.poll)
     {
-        socket.non_blocking(true);
-        if (opts.socket_size != 0)
-        {
-            socket.set_option(udp::socket::receive_buffer_size(opts.socket_size));
-            udp::socket::receive_buffer_size actual;
-            socket.get_option(actual);
-            if ((std::size_t) actual.value() != opts.socket_size)
-            {
-                std::cerr << "Warning: requested socket buffer size of " << opts.socket_size
-                    << " but actual size is " << actual.value() << '\n';
-            }
-        }
+        prepare_socket(opts);
         timer.expires_from_now(std::chrono::seconds(1));
 
         enqueue_wait();
@@ -316,6 +331,138 @@ public:
         io_service.run();
     }
 };
+
+class file_descriptor : public boost::noncopyable
+{
+public:
+    int fd;
+
+    explicit file_descriptor(int fd = -1) : fd(fd) {}
+
+    file_descriptor(file_descriptor &&other) : fd(other.fd)
+    {
+        other.fd = -1;
+    }
+
+    file_descriptor &operator=(file_descriptor &&other)
+    {
+        if (this != &other)
+        {
+            if (fd != -1)
+                close(fd);
+            fd = other.fd;
+            other.fd = -1;
+        }
+        return *this;
+    }
+
+    ~file_descriptor()
+    {
+        if (fd != -1)
+            close(fd);
+    }
+};
+
+#if USE_RECVMMSG
+class recvmmsg_runner : public socket_runner<std::int64_t>
+{
+private:
+    file_descriptor timerfd;
+    std::vector<std::uint8_t> buffer;
+    std::vector<struct mmsghdr> msgvec;
+    std::vector<struct iovec> iovec;
+    const int n_poll;
+
+    static constexpr int batch_size = 64;
+
+public:
+    explicit recvmmsg_runner(const options &opts)
+        : socket_runner<std::int64_t>(opts),
+        buffer(std::max(opts.buffer_size, batch_size * opts.packet_size)),
+        msgvec(batch_size), iovec(batch_size), n_poll(opts.poll)
+    {
+        prepare_socket(opts);
+        for (int i = 0; i < batch_size; i++)
+        {
+            std::memset(&msgvec[i], 0, sizeof(msgvec[i]));
+            msgvec[i].msg_hdr.msg_iov = &iovec[i];
+            msgvec[i].msg_hdr.msg_iovlen = 1;
+            iovec[i].iov_base = buffer.data() + opts.packet_size * i;
+            iovec[i].iov_len = opts.packet_size;
+        }
+
+        int fd = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK);
+        if (fd < 0)
+            throw_errno();
+        timerfd = file_descriptor(fd);
+
+        itimerspec spec;
+        spec.it_interval.tv_sec = 1;
+        spec.it_interval.tv_nsec = 0;
+        spec.it_value = spec.it_interval;
+        if (timerfd_settime(fd, 0, &spec, NULL) < 0)
+            throw_errno();
+    }
+
+    bool process_packets()
+    {
+        int result = recvmmsg(socket.native_handle(), msgvec.data(), msgvec.size(), 0, NULL);
+        if (result < 0)
+        {
+            if (errno != EAGAIN)
+                throw_errno();
+            return false;
+        }
+        for (int i = 0; i < result; i++)
+        {
+            bool trunc = (msgvec[i].msg_hdr.msg_flags & MSG_TRUNC);
+            counters.add_packet(msgvec[i].msg_len, trunc);
+        }
+        return true;
+    }
+
+    void run()
+    {
+        pollfd fds[2] = {};
+        fds[0].fd = socket.native_handle();
+        fds[0].events = POLLIN;
+        fds[1].fd = timerfd.fd;
+        fds[1].events = POLLIN;
+        /* This might not be perfectly synced with the timer, but all
+         * that actually matters is that we advance it each time the
+         * timer fires.
+         */
+        auto alarm_time = std::chrono::steady_clock::now();
+        while (true)
+        {
+            int result = poll(fds, 2, -1);
+            if (result < 0)
+                throw_errno();
+            if (fds[0].revents & POLLIN)
+            {
+                for (int i = 0; i <= n_poll; i++)
+                    if (!process_packets())
+                        break;
+            }
+            if (fds[1].revents & POLLIN)
+            {
+                uint64_t fired;
+                result = read(timerfd.fd, &fired, sizeof(fired));
+                if (result < 0)
+                {
+                    if (errno != EAGAIN)
+                        throw_errno();
+                }
+                else
+                {
+                    alarm_time += std::chrono::seconds(fired);
+                    show_stats(alarm_time);
+                }
+            }
+        }
+    }
+};
+#endif
 
 class pcap_runner : public socket_runner<std::int64_t>
 {
@@ -426,26 +573,6 @@ static void apply_offset(const T *&out, const void *in, std::ptrdiff_t offset)
 {
     out = reinterpret_cast<const T *>(reinterpret_cast<const std::uint8_t *>(in) + offset);
 }
-
-class file_descriptor : public boost::noncopyable
-{
-public:
-    int fd;
-
-    explicit file_descriptor(int fd = -1) : fd(fd) {}
-
-    file_descriptor(file_descriptor &&other) : fd(other.fd)
-    {
-        other.fd = -1;
-    }
-
-    ~file_descriptor()
-    {
-        if (fd != -1)
-            close(fd);
-    }
-
-};
 
 class memory_map : public boost::noncopyable
 {
@@ -721,6 +848,14 @@ int main(int argc, char **argv)
         }
         else
 #endif // HAVE_LINUX_IF_PACKET_H
+#if USE_RECVMMSG
+        if (opts.mode == "recvmmsg")
+        {
+            recvmmsg_runner r(opts);
+            r.run();
+        }
+        else
+#endif
         if (opts.mode == "pcap")
         {
             pcap_runner r(opts);
