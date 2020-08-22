@@ -541,18 +541,15 @@ public:
             int ret = io_uring_submit_and_wait(&ring, batch);
             if (ret < 0)
                 throw_errno(-ret);
-            for (int i = 0; i < batch; i++)
+            int seen = 0;
+            io_uring_cqe *cqe;
+            unsigned head;
+            io_uring_for_each_cqe(&ring, head, cqe)
             {
-                io_uring_cqe *cqe;
-                ret = io_uring_peek_cqe(&ring, &cqe);
-                if (ret == -EAGAIN)
-                    break;
-                else if (ret < 0)
-                    throw_errno(-ret);
+                seen++;
                 if ((void *) cqe->user_data == &timeout)
                 {
                     // Don't check the error code - it will most likely be -ETIME
-                    io_uring_cqe_seen(&ring, cqe);
                     sqe = io_uring_get_sqe(&ring);
                     io_uring_prep_timeout(sqe, &timeout, 0, 0);
                     io_uring_sqe_set_data(sqe, &timeout);
@@ -563,19 +560,20 @@ public:
                     if (cqe->res < 0)
                     {
                         int err = -cqe->res;
-                        io_uring_cqe_seen(&ring, cqe);
                         throw_errno(err);
                     }
                     msghdr *hdr = (msghdr *) cqe->user_data;
                     bool trunc = (hdr->msg_flags & MSG_TRUNC);
                     counters.add_packet(cqe->res, trunc);
-                    io_uring_cqe_seen(&ring, cqe);
 
                     sqe = io_uring_get_sqe(&ring);
                     io_uring_prep_recvmsg(sqe, socket.native_handle(), hdr, 0);
                     io_uring_sqe_set_data(sqe, hdr);
                 }
+                if (seen == batch)
+                    break;
             }
+            io_uring_cq_advance(&ring, seen);
         }
     }
 };
