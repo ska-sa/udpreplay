@@ -488,12 +488,11 @@ private:
     std::vector<std::uint8_t> buffer;
     std::vector<struct iovec> iovec;
     std::vector<struct msghdr> msgvec;
-    file_descriptor timerfd;
-    struct iovec timer_iovec;
-    std::uint64_t timer_data;
+    __kernel_timespec timeout;
 
     static constexpr int entries = 64;
     static constexpr int depth = entries - 1;  // one slot reserved for timeout
+    static constexpr int batch = 32;
 
 public:
     explicit io_uring_runner(const options &opts)
@@ -501,20 +500,6 @@ public:
         buffer(std::max(opts.buffer_size, depth * opts.packet_size)),
         iovec(depth), msgvec(depth)
     {
-        // TODO: this code is mostly duplicated with recvmmsg_runner
-        int fd = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC);
-        if (fd < 0)
-            throw_errno();
-        timerfd = file_descriptor(fd);
-        itimerspec spec;
-        spec.it_interval.tv_sec = 1;
-        spec.it_interval.tv_nsec = 0;
-        spec.it_value = spec.it_interval;
-        if (timerfd_settime(fd, 0, &spec, NULL) < 0)
-            throw_errno();
-        timer_iovec.iov_base = &timer_data;
-        timer_iovec.iov_len = sizeof(timer_data);
-
         prepare_socket(opts);
         socket.non_blocking(false);
         int result = io_uring_queue_init(entries, &ring, 0);
@@ -529,6 +514,9 @@ public:
             msgvec[i].msg_iov = &iovec[i];
             msgvec[i].msg_iovlen = 1;
         }
+
+        timeout.tv_sec = 1;
+        timeout.tv_nsec = 0;
     }
 
     ~io_uring_runner()
@@ -545,42 +533,49 @@ public:
             io_uring_sqe_set_data(sqe, &msgvec[i]);
         }
         io_uring_sqe *sqe = io_uring_get_sqe(&ring);
-        io_uring_prep_readv(sqe, timerfd.fd, &timer_iovec, 1, 0);
-        io_uring_sqe_set_data(sqe, &timer_data);
-        io_uring_submit(&ring);
+        io_uring_prep_timeout(sqe, &timeout, 0, 0);
+        io_uring_sqe_set_data(sqe, &timeout);
 
-        auto alarm_time = std::chrono::steady_clock::now();
         while (true)
         {
-            io_uring_cqe *cqe;
-            int ret = io_uring_wait_cqe(&ring, &cqe);
+            int ret = io_uring_submit_and_wait(&ring, batch);
             if (ret < 0)
                 throw_errno(-ret);
-            if (cqe->res < 0)
+            for (int i = 0; i < batch; i++)
             {
-                int err = -cqe->res;
-                io_uring_cqe_seen(&ring, cqe);
-                throw_errno(err);
+                io_uring_cqe *cqe;
+                ret = io_uring_peek_cqe(&ring, &cqe);
+                if (ret == -EAGAIN)
+                    break;
+                else if (ret < 0)
+                    throw_errno(-ret);
+                if ((void *) cqe->user_data == &timeout)
+                {
+                    // Don't check the error code - it will most likely be -ETIME
+                    io_uring_cqe_seen(&ring, cqe);
+                    sqe = io_uring_get_sqe(&ring);
+                    io_uring_prep_timeout(sqe, &timeout, 0, 0);
+                    io_uring_sqe_set_data(sqe, &timeout);
+                    show_stats(std::chrono::steady_clock::now());
+                }
+                else
+                {
+                    if (cqe->res < 0)
+                    {
+                        int err = -cqe->res;
+                        io_uring_cqe_seen(&ring, cqe);
+                        throw_errno(err);
+                    }
+                    msghdr *hdr = (msghdr *) cqe->user_data;
+                    bool trunc = (hdr->msg_flags & MSG_TRUNC);
+                    counters.add_packet(cqe->res, trunc);
+                    io_uring_cqe_seen(&ring, cqe);
+
+                    sqe = io_uring_get_sqe(&ring);
+                    io_uring_prep_recvmsg(sqe, socket.native_handle(), hdr, 0);
+                    io_uring_sqe_set_data(sqe, hdr);
+                }
             }
-            if ((void *) cqe->user_data == &timer_data)
-            {
-                alarm_time += std::chrono::seconds(timer_data);
-                sqe = io_uring_get_sqe(&ring);
-                io_uring_prep_readv(sqe, timerfd.fd, &timer_iovec, 1, 0);
-                io_uring_sqe_set_data(sqe, &timer_data);
-                show_stats(alarm_time);
-            }
-            else
-            {
-                msghdr *hdr = (msghdr *) cqe->user_data;
-                bool trunc = (hdr->msg_flags & MSG_TRUNC);
-                counters.add_packet(cqe->res, trunc);
-                sqe = io_uring_get_sqe(&ring);
-                io_uring_prep_recvmsg(sqe, socket.native_handle(), hdr, 0);
-                io_uring_sqe_set_data(sqe, hdr);
-            }
-            io_uring_cqe_seen(&ring, cqe);
-            io_uring_submit(&ring);    // TODO: use submit-and-wait
         }
     }
 };
