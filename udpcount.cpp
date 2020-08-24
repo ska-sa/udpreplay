@@ -517,6 +517,17 @@ public:
 
         timeout.tv_sec = 1;
         timeout.tv_nsec = 0;
+
+        struct iovec buffer_iovec;
+        buffer_iovec.iov_base = buffer.data();
+        buffer_iovec.iov_len = buffer.size();
+        result = io_uring_register_buffers(&ring, &buffer_iovec, 1);
+        if (result < 0)
+            throw_errno(-result);
+        int socket_fd = socket.native_handle();
+        result = io_uring_register_files(&ring, &socket_fd, 1);
+        if (result < 0)
+            throw_errno(-result);
     }
 
     ~io_uring_runner()
@@ -529,7 +540,10 @@ public:
         for (int i = 0; i < depth; i++)
         {
             io_uring_sqe *sqe = io_uring_get_sqe(&ring);
-            io_uring_prep_recvmsg(sqe, socket.native_handle(), &msgvec[i], 0);
+            io_uring_prep_read_fixed(
+                sqe, 0,
+                iovec[i].iov_base, iovec[i].iov_len, 0, 0);
+            sqe->flags |= IOSQE_FIXED_FILE;
             io_uring_sqe_set_data(sqe, &msgvec[i]);
         }
         io_uring_sqe *sqe = io_uring_get_sqe(&ring);
@@ -563,11 +577,13 @@ public:
                         throw_errno(err);
                     }
                     msghdr *hdr = (msghdr *) cqe->user_data;
-                    bool trunc = (hdr->msg_flags & MSG_TRUNC);
-                    counters.add_packet(cqe->res, trunc);
+                    counters.add_packet(cqe->res, false);
 
                     sqe = io_uring_get_sqe(&ring);
-                    io_uring_prep_recvmsg(sqe, socket.native_handle(), hdr, 0);
+                    io_uring_prep_read_fixed(
+                        sqe, 0,
+                        hdr->msg_iov[0].iov_base, hdr->msg_iov[0].iov_len, 0, 0);
+                    sqe->flags |= IOSQE_FIXED_FILE;
                     io_uring_sqe_set_data(sqe, hdr);
                 }
                 if (seen == batch)
