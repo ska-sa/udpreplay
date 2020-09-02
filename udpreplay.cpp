@@ -185,7 +185,7 @@ static void run(pcap_t *p, const options &opts)
     else
         rep_step = data.per_byte * data.bytes + data.per_packet * data.packets;
 
-    std::cout << "Packets loading, starting transmission" << std::endl;
+    std::cout << "Packets loaded, starting transmission" << std::endl;
 
     do
     {

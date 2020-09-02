@@ -29,9 +29,12 @@
 #include <net/ethernet.h>
 #include <net/if_arp.h>
 #include <netpacket/packet.h>
+#include <config.h>
 #include "ibv_transmit.h"
 
 using boost::asio::ip::udp;
+
+constexpr std::size_t header_size = 42;
 
 static mac_address multicast_mac(const boost::asio::ip::address_v4 &address)
 {
@@ -168,7 +171,6 @@ ibv_collector::ibv_collector(
 
 void ibv_collector::add_packet(const packet &pkt)
 {
-    constexpr std::size_t header_size = 42;
     std::size_t raw_size = pkt.len + header_size;
 
     if (slabs.empty() || slabs.back().capacity - slabs.back().used < raw_size)
@@ -331,9 +333,9 @@ ibv_transmit::ibv_transmit(const options &opts, boost::asio::io_service &io_serv
     qp_init_attr.recv_cq = cq.get();
     qp_init_attr.qp_type = IBV_QPT_RAW_PACKET;
     qp_init_attr.cap.max_send_wr = depth;
-    qp_init_attr.cap.max_recv_wr = 1;
+    qp_init_attr.cap.max_recv_wr = 0;
     qp_init_attr.cap.max_send_sge = 1;
-    qp_init_attr.cap.max_recv_sge = 1;
+    qp_init_attr.cap.max_recv_sge = 0;
     qp_init_attr.sq_sig_all = 0;
     qp.reset(ibv_create_qp(pd.get(), &qp_init_attr));
     if (!qp)
@@ -344,6 +346,25 @@ ibv_transmit::ibv_transmit(const options &opts, boost::asio::io_service &io_serv
     modify_state(IBV_QPS_RTR);
     modify_state(IBV_QPS_RTS);
 
+#if HAVE_PACKET_PACING
+    if (opts.mbps != 0)
+    {
+        double rate_kbps = opts.mbps * 1000;
+        ibv_device_attr_ex device_attr;
+        if (rate_kbps >= 1
+            && ibv_query_device_ex(cm_id->verbs, NULL, &device_attr) == 0
+            && device_attr.packet_pacing_caps.qp_rate_limit_min <= rate_kbps
+            && device_attr.packet_pacing_caps.qp_rate_limit_max >= rate_kbps
+            && ibv_is_qpt_supported(device_attr.packet_pacing_caps.supported_qpts,
+                                    IBV_QPT_RAW_PACKET))
+        {
+            rate_limit_kbps = (int) round(rate_kbps);
+            set_rate_limit = true;  // tells send_packet to set the limit the first time
+            std::cout << "Using HW rate limiting\n";
+        }
+    }
+#endif
+
     collector.reset(new ibv_collector(
             pd.get(), src_endpoint,
             get_mac(src_endpoint.address()), opts.ttl));
@@ -352,6 +373,19 @@ ibv_transmit::ibv_transmit(const options &opts, boost::asio::io_service &io_serv
 void ibv_transmit::send_packets(std::size_t first, std::size_t last,
                                 time_point start)
 {
+#if HAVE_PACKET_PACING
+    if (set_rate_limit)
+    {
+        set_rate_limit = false;
+        ibv_qp_rate_limit_attr rate_attr = {};
+        rate_attr.rate_limit = rate_limit_kbps;
+        rate_attr.typical_pkt_sz = collector->bytes() / collector->num_packets() + header_size;
+        int ret = ibv_modify_qp_rate_limit(qp.get(), &rate_attr);
+        if (ret != 0)
+            throw std::system_error(ret, std::system_category(), "ibv_modify_qp_rate_limit failed");
+    }
+#endif
+
     (void) start; // unused;
     if (first == last)
         return;
@@ -400,7 +434,17 @@ void ibv_transmit::flush()
     wait_for_wc(depth);
 }
 
+bool ibv_transmit::handles_rate_limit() const
+{
+    return rate_limit_kbps > 0;
+}
+
 constexpr int ibv_transmit::depth;
 constexpr int ibv_transmit::batch_size;
+
+bool handles_rate_limit(const ibv_transmit &transmitter)
+{
+    return transmitter.handles_rate_limit();
+}
 
 #endif // HAVE_IBV

@@ -151,6 +151,8 @@ private:
     boost::asio::ip::udp::socket socket; // only to allocate a port number
     std::size_t slots = depth;
     std::unique_ptr<ibv_collector> collector;
+    uint32_t rate_limit_kbps = false;
+    bool set_rate_limit = false;
 
     void modify_state(ibv_qp_state state, int port_num = -1);
     void wait_for_wc(std::size_t min_slots);
@@ -163,7 +165,10 @@ public:
     collector_type &get_collector() { return *collector; }
     void send_packets(std::size_t first, std::size_t last, time_point start);
     void flush();
+    bool handles_rate_limit() const;
 };
+
+bool handles_rate_limit(const ibv_transmit &transmitter);
 
 #endif // HAVE_IBV
 #endif // UDPREPLAY_IBV_TRANSMIT_H

@@ -82,6 +82,11 @@ public:
     std::size_t bytes() const;   // total payload bytes collected
 };
 
+// Overload for specific transmitter classes to determine whether they handle
+// rate-limiting internally.
+template<typename T>
+bool handles_rate_limit(const T &transmitter) { return false; }
+
 void set_buffer_size(boost::asio::ip::udp::socket &socket, std::size_t size);
 void set_ttl(boost::asio::ip::udp::socket &socket, std::uint8_t ttl);
 
