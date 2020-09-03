@@ -151,8 +151,9 @@ private:
     boost::asio::ip::udp::socket socket; // only to allocate a port number
     std::size_t slots = depth;
     std::unique_ptr<ibv_collector> collector;
-    uint32_t rate_limit_kbps = false;
+    std::uint32_t rate_limit_kbps = false;
     bool set_rate_limit = false;
+    std::uint32_t max_burst_size = 0;
 
     void modify_state(ibv_qp_state state, int port_num = -1);
     void wait_for_wc(std::size_t min_slots);

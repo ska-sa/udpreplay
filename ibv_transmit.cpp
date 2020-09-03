@@ -347,7 +347,7 @@ ibv_transmit::ibv_transmit(const options &opts, boost::asio::io_service &io_serv
     modify_state(IBV_QPS_RTS);
 
 #if HAVE_PACKET_PACING
-    if (opts.mbps != 0)
+    if (opts.mbps != 0 && !opts.sw_pacing)
     {
         double rate_kbps = opts.mbps * 1000;
         ibv_device_attr_ex device_attr;
@@ -360,7 +360,8 @@ ibv_transmit::ibv_transmit(const options &opts, boost::asio::io_service &io_serv
         {
             rate_limit_kbps = (int) round(rate_kbps);
             set_rate_limit = true;  // tells send_packet to set the limit the first time
-            std::cout << "Using HW rate limiting\n";
+            max_burst_size = opts.burst_size;
+            std::cout << "Using HW packet pacing\n";
         }
     }
 #endif
@@ -380,6 +381,7 @@ void ibv_transmit::send_packets(std::size_t first, std::size_t last,
         ibv_qp_rate_limit_attr rate_attr = {};
         rate_attr.rate_limit = rate_limit_kbps;
         rate_attr.typical_pkt_sz = collector->bytes() / collector->num_packets() + header_size;
+        rate_attr.max_burst_sz = max_burst_size;
         int ret = ibv_modify_qp_rate_limit(qp.get(), &rate_attr);
         if (ret != 0)
             throw std::system_error(ret, std::system_category(), "ibv_modify_qp_rate_limit failed");
