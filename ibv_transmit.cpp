@@ -273,11 +273,11 @@ void ibv_transmit::modify_state(ibv_qp_state state, int port_num)
 
 void ibv_transmit::wait_for_wc(std::size_t min_slots)
 {
-    ibv_wc wc[batch_size];
+    ibv_wc wc;
     while (slots < min_slots)
     {
         int status;
-        while ((status = ibv_poll_cq(cq.get(), batch_size, wc)) == 0)
+        while ((status = ibv_poll_cq(cq.get(), 1, &wc)) == 0)
         {
             // Do nothing
         }
@@ -285,15 +285,15 @@ void ibv_transmit::wait_for_wc(std::size_t min_slots)
             throw std::runtime_error("ibv_poll_cq failed");
         for (int i = 0; i < status; i++)
         {
-            if (wc[i].status != IBV_WC_SUCCESS)
+            if (wc.status != IBV_WC_SUCCESS)
             {
-                std::cerr << "WC failure: id=" << wc[i].wr_id
-                    << " status=" << wc[i].status
-                    << " vendor_err=" << wc[i].vendor_err
+                std::cerr << "WC failure: id=" << wc.wr_id
+                    << " status=" << wc.status
+                    << " vendor_err=" << wc.vendor_err
                     << '\n';
                 throw std::runtime_error("send failed");
             }
-            slots += wc[i].wr_id;
+            slots += wc.wr_id;
         }
     }
 }
