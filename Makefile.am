@@ -1,4 +1,4 @@
-LDADD = -lpcap -lboost_system -lboost_program_options
+LDADD = -lpcap -lboost_program_options
 AM_LDFLAGS = -pthread
 AM_CXXFLAGS = -Wall -std=c++11 -pthread
 

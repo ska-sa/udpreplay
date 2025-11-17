@@ -19,15 +19,6 @@ LIBS="$SAVED_LIBS"
 
 # Check for asio
 AC_CHECK_HEADER([boost/asio.hpp], [], [AC_MSG_FAILURE([boost/asio.hpp not found])])
-AC_MSG_CHECKING([for boost_system library])
-SAVED_LIBS="$LIBS"
-LIBS="-lboost_system $LIBS"
-AC_LINK_IFELSE(
-    [AC_LANG_PROGRAM([[#include <boost/system/system_error.hpp>]],
-                     [[boost::system::error_code ec;]])],
-    [AC_MSG_RESULT(yes)],
-    [AC_MSG_RESULT(no)
-     AC_MSG_FAILURE([boost_system library not found])])
 
 # Check for pcap
 AC_CHECK_HEADER([pcap/pcap.h], [], [AC_MSG_FAILURE([pcap/pcap.h not found])])
