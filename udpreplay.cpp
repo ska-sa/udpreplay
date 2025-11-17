@@ -264,7 +264,7 @@ static options parse_args(int argc, char **argv)
         ("mode", po::value<std::string>(&out.mode)->default_value(defaults.mode), "transmit mode (asio/sendmmsg/ibv)")
         ("buffer-size", po::value<size_t>(&out.buffer_size)->default_value(defaults.buffer_size), "transmit buffer size (0 for system default)")
         ("ttl", po::value<uint8_t>(&out.ttl)->default_value(defaults.ttl), "TTL for multicast (0 for system default)")
-        ("repeat", po::value<size_t>(&out.repeat), "send the data this many times")
+        ("repeat", po::value<std::uint64_t>(&out.repeat), "send the data this many times")
         ("addresses", po::value<int>(&out.addresses)->default_value(defaults.addresses), "number of sequential addresses to use with generator")
         ("pause", po::bool_switch(&out.pause)->default_value(defaults.pause), "after completion, wait for user input then send again")
         ;
