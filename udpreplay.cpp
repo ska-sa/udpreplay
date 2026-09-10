@@ -251,6 +251,9 @@ static options parse_args(int argc, char **argv)
     positional.add("input-file", 1);
 
     po::options_description desc;
+    // We can't store directly into out.ttl, because uint8_t is really unsigned
+    // char and it would get parsed as a character instead of a number.
+    unsigned int ttl;
     desc.add_options()
         ("pps", po::value<double>(&out.pps), "packets per second (0 for max speed)")
         ("mbps", po::value<double>(&out.mbps), "bits per second (0 for max speed)")
@@ -263,7 +266,7 @@ static options parse_args(int argc, char **argv)
         ("bind", po::value<std::string>(&out.bind)->default_value(defaults.bind), "local address (for multicast)")
         ("mode", po::value<std::string>(&out.mode)->default_value(defaults.mode), "transmit mode (asio/sendmmsg/ibv)")
         ("buffer-size", po::value<size_t>(&out.buffer_size)->default_value(defaults.buffer_size), "transmit buffer size (0 for system default)")
-        ("ttl", po::value<uint8_t>(&out.ttl)->default_value(defaults.ttl), "TTL for multicast (0 for system default)")
+        ("ttl", po::value<unsigned int>(&ttl)->default_value(defaults.ttl), "TTL for multicast (0 for system default)")
         ("repeat", po::value<std::uint64_t>(&out.repeat), "send the data this many times")
         ("addresses", po::value<int>(&out.addresses)->default_value(defaults.addresses), "number of sequential addresses to use with generator")
         ("pause", po::bool_switch(&out.pause)->default_value(defaults.pause), "after completion, wait for user input then send again")
@@ -288,6 +291,9 @@ static options parse_args(int argc, char **argv)
         po::notify(vm);
         if (vm.count("pps") + vm.count("mbps") + out.use_timestamps > 1)
             throw po::error("Cannot specify more than one of --pps, --mbps and --use-timestamps");
+        if (ttl > 255)
+            throw po::error("the argument for option '--ttl' is invalid");
+        out.ttl = ttl;
         try
         {
             // See if we were given a packet size instead of a file
