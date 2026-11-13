@@ -185,7 +185,7 @@ private:
     std::chrono::steady_clock::time_point last_stats;
 
 protected:
-    asio::io_service io_service;
+    asio::io_context io_context;
     metrics<T> counters;
     udp::endpoint local_endpoint;
 
@@ -205,11 +205,10 @@ protected:
 
     explicit runner(const options &opts) : last_stats(std::chrono::steady_clock::now())
     {
-        udp::resolver resolver(io_service);
-        udp::resolver::query query(
+        udp::resolver resolver(io_context);
+        local_endpoint = *resolver.resolve(
             udp::v4(), opts.host, opts.port,
-            udp::resolver::query::passive | udp::resolver::query::address_configured);
-        local_endpoint = *resolver.resolve(query);
+            udp::resolver::passive | udp::resolver::address_configured).begin();
     }
 };
 
@@ -224,7 +223,7 @@ class socket_runner : public runner<T>
 protected:
     udp::socket socket;
 
-    explicit socket_runner(const options &opts) : runner<T>(opts), socket(this->io_service)
+    explicit socket_runner(const options &opts) : runner<T>(opts), socket(this->io_context)
     {
         socket.open(udp::v4());
         socket.bind(this->local_endpoint);
@@ -308,19 +307,19 @@ private:
 
     void timer_handler(const boost::system::error_code &error)
     {
-        auto now = timer.expires_at();
+        auto now = timer.expiry();
         show_stats(now);
-        timer.expires_at(timer.expires_at() + std::chrono::seconds(1));
+        timer.expires_at(timer.expiry() + std::chrono::seconds(1));
         enqueue_wait();
     }
 
 public:
     explicit asio_runner(const options &opts)
-        : socket_runner<std::int64_t>(opts), timer(io_service),
+        : socket_runner<std::int64_t>(opts), timer(io_context),
         buffer(std::max(opts.packet_size, opts.buffer_size)), packet_size(opts.packet_size), poll(opts.poll)
     {
         prepare_socket(opts);
-        timer.expires_from_now(std::chrono::seconds(1));
+        timer.expires_after(std::chrono::seconds(1));
 
         enqueue_wait();
         enqueue_receive();
@@ -328,7 +327,7 @@ public:
 
     void run()
     {
-        io_service.run();
+        io_context.run();
     }
 };
 
@@ -638,7 +637,7 @@ private:
             { 0x48, 0, 0, 0x00000010 },
             { 0x15, 0, 3, local_endpoint.port() },
             { 0x20, 0, 0, 0x0000001e },
-            { 0x15, 0, 1, (std::uint32_t) local_endpoint.address().to_v4().to_ulong() },
+            { 0x15, 0, 1, (std::uint32_t) local_endpoint.address().to_v4().to_uint() },
             { 0x6, 0, 0, 0x0000ffff },
             { 0x6, 0, 0, 0x00000000 },
         };

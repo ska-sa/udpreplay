@@ -298,8 +298,8 @@ void ibv_transmit::wait_for_wc(std::size_t min_slots)
     }
 }
 
-ibv_transmit::ibv_transmit(const options &opts, boost::asio::io_service &io_service)
-    : socket(io_service, udp::v4())
+ibv_transmit::ibv_transmit(const options &opts, boost::asio::io_context &io_context)
+    : socket(io_context, udp::v4())
 {
     if (opts.bind == "")
         throw std::runtime_error("--bind must be specified with --mode=ibv");
