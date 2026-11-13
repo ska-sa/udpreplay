@@ -22,6 +22,7 @@
 #include <iostream>
 #include <cstring>
 #include <cassert>
+#include <cmath>
 #include <system_error>
 #include <stdexcept>
 #include <arpa/inet.h>
