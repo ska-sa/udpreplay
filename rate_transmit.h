@@ -10,7 +10,7 @@ template<typename Transmit>
 class rate_transmit
 {
 private:
-    boost::asio::io_service &io_service;
+    boost::asio::io_context &io_context;
     Transmit transmit;
     bool limited = false;
 
@@ -18,8 +18,8 @@ public:
     static constexpr int batch_size = Transmit::batch_size;
     typedef typename Transmit::collector_type collector_type;
 
-    explicit rate_transmit(const options &opts, boost::asio::io_service &io_service)
-        : io_service(io_service), transmit(opts, io_service)
+    explicit rate_transmit(const options &opts, boost::asio::io_context &io_context)
+        : io_context(io_context), transmit(opts, io_context)
     {
         limited = (opts.pps != 0 || opts.mbps != 0 || opts.use_timestamps)
             && !handles_rate_limit(transmit);
@@ -32,7 +32,7 @@ public:
         {
             auto &collector = transmit.get_collector();
             time_point next_send = start + collector.packet_timestamp(first);
-            boost::asio::basic_waitable_timer<time_point::clock> timer(io_service);
+            boost::asio::basic_waitable_timer<time_point::clock> timer(io_context);
             timer.expires_at(next_send);
             timer.wait();
         }

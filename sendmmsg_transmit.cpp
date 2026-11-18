@@ -29,8 +29,8 @@
 
 using boost::asio::ip::udp;
 
-sendmmsg_transmit::sendmmsg_transmit(const options &opts, boost::asio::io_service &io_service)
-    : socket(io_service)
+sendmmsg_transmit::sendmmsg_transmit(const options &opts, boost::asio::io_context &io_context)
+    : socket(io_context)
 {
     socket.open(udp::v4());
     set_buffer_size(socket, opts.buffer_size);

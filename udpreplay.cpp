@@ -151,9 +151,9 @@ static void prepare(pcap_t *p)
 template<typename Transmit>
 static void run(pcap_t *p, const options &opts)
 {
-    boost::asio::io_service io_service;
+    boost::asio::io_context io_context;
 
-    Transmit t(opts, io_service);
+    Transmit t(opts, io_context);
     typedef typename Transmit::collector_type Collector;
     callback_data data;
     Collector &collector = t.get_collector();
@@ -166,9 +166,8 @@ static void run(pcap_t *p, const options &opts)
     data.use_destination = opts.use_destination;
     if (!opts.use_destination)
     {
-        udp::resolver resolver(io_service);
-        udp::resolver::query query(udp::v4(), opts.host, opts.port);
-        data.destination = *resolver.resolve(query);
+        udp::resolver resolver(io_context);
+        data.destination = *resolver.resolve(udp::v4(), opts.host, opts.port).begin();
     }
 
     if (p)

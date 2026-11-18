@@ -22,6 +22,7 @@
 #include <iostream>
 #include <cstring>
 #include <cassert>
+#include <cmath>
 #include <system_error>
 #include <stdexcept>
 #include <arpa/inet.h>
@@ -298,12 +299,12 @@ void ibv_transmit::wait_for_wc(std::size_t min_slots)
     }
 }
 
-ibv_transmit::ibv_transmit(const options &opts, boost::asio::io_service &io_service)
-    : socket(io_service, udp::v4())
+ibv_transmit::ibv_transmit(const options &opts, boost::asio::io_context &io_context)
+    : socket(io_context, udp::v4())
 {
     if (opts.bind == "")
         throw std::runtime_error("--bind must be specified with --mode=ibv");
-    auto src_address = boost::asio::ip::address::from_string(opts.bind);
+    auto src_address = boost::asio::ip::make_address(opts.bind);
     udp::endpoint src_endpoint(src_address, 0);
     // Get the OS to assign us a source port
     socket.bind(src_endpoint);
@@ -358,7 +359,7 @@ ibv_transmit::ibv_transmit(const options &opts, boost::asio::io_service &io_serv
             && ibv_is_qpt_supported(device_attr.packet_pacing_caps.supported_qpts,
                                     IBV_QPT_RAW_PACKET))
         {
-            rate_limit_kbps = (int) round(rate_kbps);
+            rate_limit_kbps = (int) std::round(rate_kbps);
             set_rate_limit = true;  // tells send_packet to set the limit the first time
             max_burst_size = opts.burst_size;
             std::cout << "Using HW packet pacing\n";
