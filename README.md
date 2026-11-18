@@ -26,9 +26,8 @@ once per second.
 ## Requirements
 
 You will need libpcap (including development headers), Boost headers, and the
-libraries for the Boost `system` and `program_options` libraries. You will
-also need a modern C++11-capable compiler. GCC 4.8 and Clang 3.4 are known to
-work.
+shared library for Boost `program_options`. You will also need a C++17-capable
+compiler.
 
 ## Installation
 
